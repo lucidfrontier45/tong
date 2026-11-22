@@ -7,7 +7,7 @@ formatters:
 
   settings:
     gofumpt:
-      module-path: <your-project>
+      module-path: github.com/lucidfrontier45/tong
       extra:
         group-params: true
         clothe-returns: true

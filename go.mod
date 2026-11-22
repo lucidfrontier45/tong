@@ -1,3 +1,3 @@
-module github.com/go-project-template
+module github.com/lucidfrontier45/tong
 
 go 1.27
