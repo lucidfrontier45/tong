@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -190,28 +191,52 @@ func parseSize(value string) (int64, error) {
 	}
 
 	multiplier := int64(1)
-	switch last := value[len(value)-1]; last {
+	digits := value
+	switch last := digits[len(digits)-1]; last {
 	case 'K', 'k':
 		multiplier = 1 << 10
-		value = value[:len(value)-1]
+		digits = digits[:len(digits)-1]
 	case 'M', 'm':
 		multiplier = 1 << 20
-		value = value[:len(value)-1]
+		digits = digits[:len(digits)-1]
 	case 'G', 'g':
 		multiplier = 1 << 30
-		value = value[:len(value)-1]
+		digits = digits[:len(digits)-1]
 	}
 
-	if !sizePattern.MatchString(value) {
+	if !sizePattern.MatchString(digits) {
 		return 0, fmt.Errorf("invalid size %q", value)
 	}
 
-	size, err := strconv.ParseFloat(value, 64)
-	if err != nil || math.IsNaN(size) || math.IsInf(size, 0) || size < 0 {
+	// The number is parsed as an integer, so that a value that does not
+	// fit into an int64 is a usage error instead of a limit that quietly
+	// disappears.
+	whole, fraction, _ := strings.Cut(digits, ".")
+	number, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("size %q is too large", value)
+		}
 		return 0, fmt.Errorf("invalid size %q", value)
 	}
-	if size > float64(math.MaxInt64)/float64(multiplier) {
+
+	// The scaled number has to leave room for the fraction.
+	if number > (math.MaxInt64-(multiplier-1))/multiplier {
 		return 0, fmt.Errorf("size %q is too large", value)
 	}
-	return int64(math.Round(size * float64(multiplier))), nil
+	size := number * multiplier
+
+	if fraction != "" {
+		part, err := strconv.ParseFloat("0."+fraction, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid size %q", value)
+		}
+		extra := int64(math.Round(part * float64(multiplier)))
+		if size > math.MaxInt64-extra {
+			return 0, fmt.Errorf("size %q is too large", value)
+		}
+		size += extra
+	}
+
+	return size, nil
 }

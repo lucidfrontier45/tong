@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,7 +144,7 @@ func TestRunRefusesDeleteWithoutRecursion(t *testing.T) {
 func TestRunRejectsInvalidSizes(t *testing.T) {
 	t.Parallel()
 
-	for _, size := range []string{"NaN", "Inf", "-1", "1e3", "100000000000G"} {
+	for _, size := range []string{"NaN", "Inf", "-1", "1e3", "100000000000G", "9223372036854775808"} {
 		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 		code := Run(context.Background(), []string{"--max-size", size, "src", "dst"}, stdout, stderr)
 		if code != syncengine.CodeUsage {
@@ -218,6 +219,9 @@ func TestParseSize(t *testing.T) {
 		{value: "2M", want: 2 * 1024 * 1024},
 		{value: "1G", want: 1024 * 1024 * 1024},
 		{value: "1.5K", want: 1536},
+		{value: "9223372036854774784", want: 9223372036854774784},
+		{value: "9223372036854775807", want: math.MaxInt64},
+		{value: "9007199254740991K", want: 9223372036854774784},
 	}
 	for _, tc := range tests {
 		got, err := parseSize(tc.value)
@@ -230,7 +234,13 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 
-	for _, value := range []string{"big", "NaN", "Inf", "-1", "1e3"} {
+	for _, value := range []string{
+		"big", "NaN", "Inf", "-1", "1e3",
+		// The values that float64 rounds up to 2^63 and that therefore
+		// overflow an int64.
+		"9223372036854775808", "9223372036854776832", "9223372036854775809G",
+		"9007199254740992K",
+	} {
 		if _, err := parseSize(value); err == nil {
 			t.Errorf("parseSize(%q) = nil, want an error", value)
 		}
