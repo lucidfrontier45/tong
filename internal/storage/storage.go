@@ -86,6 +86,19 @@ type ShallowLister interface {
 	ListShallow(ctx context.Context, prefix string, fn func(FileInfo) error) error
 }
 
+// ModTimeAware is an optional capability: the backend reports the
+// modification time of the files it lists, and lets the caller say whether
+// those times are needed.
+//
+// Some backends need an extra request per file to learn the modification
+// time of a file. They skip that request when the caller does not compare
+// times.
+type ModTimeAware interface {
+	// UseModTime tells the endpoint whether the modification times of the
+	// listed files matter.
+	UseModTime(enabled bool)
+}
+
 // Location is a parsed command-line location.
 type Location struct {
 	// Scheme is the backend the location refers to.

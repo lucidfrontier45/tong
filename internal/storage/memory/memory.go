@@ -104,12 +104,25 @@ func (d *Driver) Keys(root string) []string {
 
 	var keys []string
 	for full := range d.files {
-		if after, ok := strings.CutPrefix(full, namespace(root)+"/"); ok {
-			keys = append(keys, after)
+		key, ok := relative(namespace(root), full)
+		if !ok {
+			continue
 		}
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// relative returns the key of a file inside a namespace.
+func relative(root, full string) (string, bool) {
+	if root == "" {
+		return full, true
+	}
+	if after, ok := strings.CutPrefix(full, root+"/"); ok {
+		return after, true
+	}
+	return "", false
 }
 
 // endpoint is a rooted view of an in-memory namespace.
@@ -127,9 +140,11 @@ func (e *endpoint) List(ctx context.Context, prefix string, fn func(storage.File
 
 	var keys []string
 	for key := range files {
-		if strings.HasPrefix(key, e.root+"/") {
-			keys = append(keys, key)
+		rel, ok := relative(e.root, key)
+		if !ok {
+			continue
 		}
+		keys = append(keys, rel)
 	}
 	sort.Strings(keys)
 
@@ -137,7 +152,7 @@ func (e *endpoint) List(ctx context.Context, prefix string, fn func(storage.File
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rel := strings.TrimPrefix(key, e.root+"/")
+		rel := key
 		if !strings.HasPrefix(rel, prefix) {
 			continue
 		}

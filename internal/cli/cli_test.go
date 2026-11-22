@@ -121,6 +121,37 @@ func TestRunDryRunPrintsThePlan(t *testing.T) {
 	}
 }
 
+func TestRunRefusesDeleteWithoutRecursion(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	dst := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatalf("cannot write the source: %v", err)
+	}
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(context.Background(), []string{"--delete", src + "/", dst}, stdout, stderr)
+	if code != syncengine.CodeUsage {
+		t.Fatalf("Run() = %d, want %d", code, syncengine.CodeUsage)
+	}
+	if !strings.Contains(stderr.String(), "--delete") {
+		t.Errorf("the error is %q, want it to mention --delete", stderr)
+	}
+}
+
+func TestRunRejectsInvalidSizes(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []string{"NaN", "Inf", "-1", "1e3", "100000000000G"} {
+		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+		code := Run(context.Background(), []string{"--max-size", size, "src", "dst"}, stdout, stderr)
+		if code != syncengine.CodeUsage {
+			t.Errorf("Run(--max-size %s) = %d, want %d", size, code, syncengine.CodeUsage)
+		}
+	}
+}
+
 func TestRunCopiesASingleFileOntoTheDestination(t *testing.T) {
 	t.Parallel()
 
@@ -199,7 +230,9 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 
-	if _, err := parseSize("big"); err == nil {
-		t.Error("parseSize(\"big\") = nil, want an error")
+	for _, value := range []string{"big", "NaN", "Inf", "-1", "1e3"} {
+		if _, err := parseSize(value); err == nil {
+			t.Errorf("parseSize(%q) = nil, want an error", value)
+		}
 	}
 }

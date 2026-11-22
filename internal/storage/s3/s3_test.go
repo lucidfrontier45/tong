@@ -3,6 +3,7 @@ package s3_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -40,16 +41,7 @@ func TestIntegration(t *testing.T) {
 
 	createBucket(t, ctx, region, endpoint, bucket)
 
-	prefix := "tong-test/" + strings.ReplaceAll(t.Name(), "/", "-") + "/"
-	source, err := driver.ResolveSource(ctx, storage.Location{
-		Scheme:   storage.SchemeS3,
-		Bucket:   bucket,
-		Key:      prefix,
-		Trailing: true,
-	})
-	if err != nil {
-		t.Fatalf("ResolveSource() = %v", err)
-	}
+	prefix := "tong/" + strings.ReplaceAll(t.Name(), "/", "-") + "/"
 	dest, err := driver.ResolveDest(ctx, storage.Location{
 		Scheme: storage.SchemeS3,
 		Bucket: bucket,
@@ -70,6 +62,29 @@ func TestIntegration(t *testing.T) {
 		}
 	})
 
+	// The prefix holds an object now, so it is a source.
+	source, err := driver.ResolveSource(ctx, storage.Location{
+		Scheme:   storage.SchemeS3,
+		Bucket:   bucket,
+		Key:      prefix,
+		Trailing: true,
+	})
+	if err != nil {
+		t.Fatalf("ResolveSource() = %v", err)
+	}
+
+	// A prefix that holds nothing is not a source, so that a typo cannot
+	// empty a destination with --delete.
+	_, err = driver.ResolveSource(ctx, storage.Location{
+		Scheme:   storage.SchemeS3,
+		Bucket:   bucket,
+		Key:      "tong/missing-prefix/",
+		Trailing: true,
+	})
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("ResolveSource() = %v, want %v", err, storage.ErrNotFound)
+	}
+
 	var keys []string
 	if err := dest.Endpoint.List(ctx, "", func(info storage.FileInfo) error {
 		keys = append(keys, info.Key)
@@ -89,6 +104,21 @@ func TestIntegration(t *testing.T) {
 		t.Errorf("the listing is %v, want [a.txt]", keys)
 	}
 
+	// Without the modification times the listing falls back to the time
+	// the object was written, which saves a request per object.
+	if aware, ok := dest.Endpoint.(storage.ModTimeAware); ok {
+		aware.UseModTime(false)
+		if err := dest.Endpoint.List(ctx, "", func(info storage.FileInfo) error {
+			if info.Key == "a.txt" && info.ModTime.Truncate(time.Second).Equal(modTime) {
+				t.Errorf("the listing still reports the stored modification time %v", info.ModTime)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("List() = %v", err)
+		}
+		aware.UseModTime(true)
+	}
+
 	reader, err := source.Endpoint.Open(ctx, "a.txt")
 	if err != nil {
 		t.Fatalf("Open() = %v", err)
@@ -102,5 +132,14 @@ func TestIntegration(t *testing.T) {
 	}
 	if !bytes.Equal(got, content) {
 		t.Errorf("the object holds %q, want %q", got, content)
+	}
+
+	// An object that is gone is reported as missing, so that the engine
+	// can tell it from a failed transfer.
+	if err := dest.Endpoint.Delete(ctx, "a.txt"); err != nil {
+		t.Fatalf("Delete() = %v", err)
+	}
+	if _, err := source.Endpoint.Open(ctx, "a.txt"); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("Open() = %v, want %v", err, storage.ErrNotFound)
 	}
 }

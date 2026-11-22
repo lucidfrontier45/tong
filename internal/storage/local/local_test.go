@@ -7,12 +7,27 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lucidfrontier45/tong/internal/storage"
 	"github.com/lucidfrontier45/tong/internal/storage/local"
 )
+
+// failingReader fails after the first read.
+type failingReader struct {
+	read bool
+}
+
+// Read returns some data and then fails.
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, errors.New("the source cannot be read")
+	}
+	r.read = true
+	return copy(p, []byte("new")), nil
+}
 
 func TestDriverResolvesDirectories(t *testing.T) {
 	t.Parallel()
@@ -120,6 +135,46 @@ func TestDriverCreatesAndDeletesFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "sub", "a.txt")); !errors.Is(err, fs.ErrNotExist) {
 		t.Error("the file still exists, want it to be deleted")
+	}
+}
+
+func TestDriverKeepsThePreviousCopyWhenATransferFails(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	driver := local.New()
+	dest, err := driver.ResolveDest(context.Background(), storage.Location{
+		Scheme: storage.SchemeFile,
+		Path:   root,
+	}, false)
+	if err != nil {
+		t.Fatalf("ResolveDest() = %v", err)
+	}
+
+	if err := dest.Endpoint.Create(context.Background(), "a.txt", time.Time{}, bytes.NewReader([]byte("old"))); err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+
+	if err := dest.Endpoint.Create(context.Background(), "a.txt", time.Time{}, &failingReader{}); err == nil {
+		t.Fatal("Create() = nil, want the failed transfer to be reported")
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "a.txt")) //nolint:gosec // the test wrote the file
+	if err != nil {
+		t.Fatalf("cannot read the destination: %v", err)
+	}
+	if string(got) != "old" {
+		t.Errorf("a.txt = %q, want the previous copy to be kept", got)
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("cannot read the directory: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tong-") {
+			t.Errorf("the temporary file %s was left behind", entry.Name())
+		}
 	}
 }
 

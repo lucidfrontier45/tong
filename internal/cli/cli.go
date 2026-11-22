@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -86,6 +88,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return syncengine.CodeUsage
 	}
 
+	recursive := opts.Recursive || opts.Archive
+	if opts.Delete && !recursive {
+		// rsync refuses the combination, because a sync that does not
+		// recurse cannot know what the destination should hold.
+		_, _ = fmt.Fprintln(stderr, "tong: --delete does not work without --recursive (-r) or --archive (-a)")
+		return syncengine.CodeUsage
+	}
+
 	rules, err := filterRules(args)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "tong: %v\n", err)
@@ -131,7 +141,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	return syncengine.Run(ctx, sources, dest, syncengine.Options{
-		Recursive:      opts.Recursive || opts.Archive,
+		Recursive:      recursive,
 		Times:          opts.Times || opts.Archive,
 		SizeOnly:       opts.SizeOnly,
 		Update:         opts.Update,
@@ -143,7 +153,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		MaxSize:        maxSize,
 		MinSize:        minSize,
 		Rules:          rules,
-	}, stdout)
+	}, stdout, stderr)
 }
 
 // unsupported lists the options that tong parses but cannot honour yet.
@@ -170,6 +180,9 @@ func (o *options) unsupported() []string {
 	return out
 }
 
+// sizePattern matches the number of a size, with an optional fraction.
+var sizePattern = regexp.MustCompile(`^\d+(\.\d+)?$`)
+
 // parseSize parses a size such as "1024", "10K", "1.5M" or "2G".
 func parseSize(value string) (int64, error) {
 	if value == "" {
@@ -189,12 +202,16 @@ func parseSize(value string) (int64, error) {
 		value = value[:len(value)-1]
 	}
 
+	if !sizePattern.MatchString(value) {
+		return 0, fmt.Errorf("invalid size %q", value)
+	}
+
 	size, err := strconv.ParseFloat(value, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(size) || math.IsInf(size, 0) || size < 0 {
 		return 0, fmt.Errorf("invalid size %q", value)
 	}
-	if size < 0 {
-		return 0, fmt.Errorf("invalid size %q", value)
+	if size > float64(math.MaxInt64)/float64(multiplier) {
+		return 0, fmt.Errorf("size %q is too large", value)
 	}
-	return int64(size * float64(multiplier)), nil
+	return int64(math.Round(size * float64(multiplier))), nil
 }

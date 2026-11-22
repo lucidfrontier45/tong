@@ -90,21 +90,25 @@ type plan struct {
 
 // Run synchronises the sources into the destination and returns the exit
 // code of the run.
-func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved, opts Options, out io.Writer) int {
+func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved, opts Options, stdout, stderr io.Writer) int {
 	matcher, err := filter.New(opts.Rules)
 	if err != nil {
-		_, _ = fmt.Fprintf(out, "tong: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "tong: %v\n", err)
 		return CodeUsage
 	}
 
 	if !dest.IsDir && (len(sources) != 1 || sources[0].IsDir) {
-		_, _ = fmt.Fprintf(out, "tong: %s: cannot copy a directory onto a file\n", dest.Display)
+		_, _ = fmt.Fprintf(stderr, "tong: %s: cannot copy a directory onto a file\n", dest.Display)
 		return CodeSelect
 	}
 
+	// The modification times of the destination only matter when they are
+	// compared or preserved.
+	useModTime(dest.Endpoint, opts.Times || opts.Update)
+
 	destFiles, err := listDest(ctx, dest)
 	if err != nil {
-		_, _ = fmt.Fprintf(out, "tong: cannot read %s: %v\n", dest.Display, err)
+		_, _ = fmt.Fprintf(stderr, "tong: cannot read %s: %v\n", dest.Display, err)
 		return CodePartial
 	}
 
@@ -118,16 +122,28 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 
 	for _, src := range sources {
 		if err := p.addSource(ctx, src); err != nil {
-			_, _ = fmt.Fprintf(out, "tong: cannot read %s: %v\n", src.Display, err)
+			_, _ = fmt.Fprintf(stderr, "tong: cannot read %s: %v\n", src.Display, err)
 			return CodePartial
 		}
 	}
 
-	return p.execute(ctx, out)
+	return p.execute(ctx, stdout, stderr)
+}
+
+// useModTime tells an endpoint whether the modification times of the files
+// it lists are needed.
+func useModTime(endpoint storage.Endpoint, enabled bool) {
+	if aware, ok := endpoint.(storage.ModTimeAware); ok {
+		aware.UseModTime(enabled)
+	}
 }
 
 // addSource walks a source and collects the files that have to be copied.
 func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
+	// The modification times of the source only matter when they are
+	// preserved.
+	useModTime(src.Endpoint, p.opts.Times)
+
 	if !src.IsDir {
 		info, err := lookup(ctx, src.Endpoint, src.FileKey)
 		if err != nil {
@@ -163,7 +179,12 @@ func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
 
 // consider decides whether a source file has to be copied.
 func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo) {
-	if !p.matcher.Match(key, false) {
+	destKey := p.destKey(src, key)
+
+	// The filters match the path of the file in the destination, which is
+	// the transfer root that rsync uses. A source without a trailing
+	// separator keeps its own name in that path.
+	if !p.matcher.Match(destKey, false) {
 		return
 	}
 	if p.opts.MinSize > 0 && info.Size < p.opts.MinSize {
@@ -173,7 +194,6 @@ func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo)
 		return
 	}
 
-	destKey := p.destKey(src, key)
 	p.planned[destKey] = true
 
 	dst, exists := p.destFiles[destKey]
@@ -215,43 +235,43 @@ func (p *plan) destPath(key string) string {
 }
 
 // execute copies the planned files and removes the extraneous ones.
-func (p *plan) execute(ctx context.Context, out io.Writer) int {
+func (p *plan) execute(ctx context.Context, stdout, stderr io.Writer) int {
 	failed, vanished := 0, 0
 
 	for _, it := range p.items {
 		srcPath := it.srcDisplay
 		destPath := p.destPath(it.destKey)
 		if p.opts.DryRun {
-			_, _ = fmt.Fprintf(out, "would copy %s -> %s\n", srcPath, destPath)
+			_, _ = fmt.Fprintf(stdout, "would copy %s -> %s\n", srcPath, destPath)
 			continue
 		}
 		if err := p.copyFile(ctx, it); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, storage.ErrNotFound) {
 				vanished++
 			} else {
 				failed++
 			}
-			_, _ = fmt.Fprintf(out, "tong: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "tong: %v\n", err)
 			continue
 		}
 		if p.opts.Verbosity > 0 {
-			_, _ = fmt.Fprintln(out, destPath)
+			_, _ = fmt.Fprintln(stdout, destPath)
 		}
 	}
 
 	for _, key := range p.deletions() {
 		destPath := p.destPath(key)
 		if p.opts.DryRun {
-			_, _ = fmt.Fprintf(out, "would delete %s\n", destPath)
+			_, _ = fmt.Fprintf(stdout, "would delete %s\n", destPath)
 			continue
 		}
 		if err := p.dest.Endpoint.Delete(ctx, key); err != nil {
 			failed++
-			_, _ = fmt.Fprintf(out, "tong: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "tong: %v\n", err)
 			continue
 		}
 		if p.opts.Verbosity > 0 {
-			_, _ = fmt.Fprintf(out, "deleting %s\n", destPath)
+			_, _ = fmt.Fprintf(stdout, "deleting %s\n", destPath)
 		}
 	}
 
@@ -268,6 +288,12 @@ func (p *plan) execute(ctx context.Context, out io.Writer) int {
 // deletions returns the destination keys that the sources do not provide.
 func (p *plan) deletions() []string {
 	if !p.opts.Delete {
+		return nil
+	}
+	if !p.opts.Recursive {
+		// Without recursion the transfer only covers the top level, so
+		// nothing below it may be deleted. rsync refuses the combination
+		// outright; tong only leaves the destination alone.
 		return nil
 	}
 

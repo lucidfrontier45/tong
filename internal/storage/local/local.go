@@ -3,6 +3,8 @@ package local
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -225,16 +227,27 @@ func (e *endpoint) Open(_ context.Context, key string) (io.ReadCloser, error) {
 }
 
 // Create writes the contents of r to key.
+//
+// The data is written to a temporary file next to the destination and moved
+// into place afterwards, the way rsync does it. A transfer that fails halfway
+// therefore leaves the previous copy of the file alone.
 func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io.Reader) error {
 	full, err := e.resolve(key)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(full), dirPerm); err != nil { //nolint:gosec // directories are meant to be readable
+	dir := filepath.Dir(full)
+	if err := os.MkdirAll(dir, dirPerm); err != nil { //nolint:gosec // directories are meant to be readable
 		return err
 	}
 
-	file, err := os.Create(full) //nolint:gosec // path is validated above
+	name, err := tempName(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(name) }()
+
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666) //nolint:gosec // the name is random and inside the root
 	if err != nil {
 		return err
 	}
@@ -246,11 +259,26 @@ func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io
 		return err
 	}
 	if !modTime.IsZero() {
-		if err := os.Chtimes(full, modTime, modTime); err != nil {
+		if err := os.Chtimes(name, modTime, modTime); err != nil {
 			return err
 		}
 	}
-	return nil
+	return os.Rename(name, full)
+}
+
+// tempName returns a unique name for a temporary file in a directory.
+func tempName(dir string) (string, error) {
+	for range 10 {
+		var buf [8]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			return "", err
+		}
+		name := filepath.Join(dir, ".tong-"+hex.EncodeToString(buf[:]))
+		if _, err := os.Stat(name); errors.Is(err, fs.ErrNotExist) {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("cannot create a temporary file in %s", dir)
 }
 
 // Delete removes the file stored under key.

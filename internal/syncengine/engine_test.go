@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -31,7 +32,7 @@ func TestRunCopiesTree(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		Options{Recursive: true, Times: true},
-		out,
+		out, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d (%s)", code, CodeOK, out)
@@ -60,7 +61,7 @@ func TestRunKeepsModificationTimes(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		Options{Recursive: true, Times: true},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -87,7 +88,7 @@ func TestRunSkipsUnchangedFiles(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		opts,
-		io.Discard,
+		io.Discard, io.Discard,
 	); code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
 	}
@@ -97,7 +98,7 @@ func TestRunSkipsUnchangedFiles(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		opts,
-		out,
+		out, io.Discard,
 	); code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
 	}
@@ -118,7 +119,7 @@ func TestRunIsNotRecursiveByDefault(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		Options{},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -143,7 +144,7 @@ func TestRunCopiesTheDirectoryItselfWithoutATrailingSeparator(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src)},
 		resolveDest(t, dst),
 		Options{Recursive: true},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -167,7 +168,7 @@ func TestRunDeletesExtraneousFiles(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		Options{Recursive: true, Delete: true},
-		out,
+		out, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d (%s)", code, CodeOK, out)
@@ -197,7 +198,7 @@ func TestRunKeepsExcludedFilesWhenDeleting(t *testing.T) {
 			Delete:    true,
 			Rules:     []filter.Rule{{Kind: filter.Exclude, Pattern: "*.log"}},
 		},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -223,7 +224,7 @@ func TestRunAppliesFilters(t *testing.T) {
 			Recursive: true,
 			Rules:     []filter.Rule{{Kind: filter.Exclude, Pattern: "*.log"}},
 		},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -246,7 +247,7 @@ func TestRunAppliesSizeLimits(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		Options{Recursive: true, MaxSize: 5},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -272,7 +273,7 @@ func TestRunDryRunChangesNothing(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, src+"/")},
 		resolveDest(t, dst),
 		Options{Recursive: true, DryRun: true},
-		out,
+		out, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -297,7 +298,7 @@ func TestRunCopiesASingleFileOntoTheDestination(t *testing.T) {
 		[]storage.Resolved{resolveSource(t, filepath.Join(src, "a.txt"))},
 		resolveDestFile(t, filepath.Join(dst, "b.txt"), true),
 		Options{},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -305,6 +306,103 @@ func TestRunCopiesASingleFileOntoTheDestination(t *testing.T) {
 
 	if got := readFile(t, filepath.Join(dst, "b.txt")); got != "hello" {
 		t.Errorf("b.txt = %q, want %q", got, "hello")
+	}
+}
+
+func TestRunKeepsTheDestinationWhenItDoesNotRecurse(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeFile(t, filepath.Join(src, "a.txt"), "hello")
+	writeFile(t, filepath.Join(dst, "extra.txt"), "extra")
+	writeFile(t, filepath.Join(dst, "sub", "nested.txt"), "nested")
+
+	code := Run(context.Background(),
+		[]storage.Resolved{resolveSource(t, src+"/")},
+		resolveDest(t, dst),
+		Options{Delete: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+
+	// A sync that does not recurse does not know what the destination
+	// should hold, so nothing may be deleted.
+	if _, err := os.Stat(filepath.Join(dst, "extra.txt")); err != nil {
+		t.Error("extra.txt was deleted, want it to be kept")
+	}
+	if _, err := os.Stat(filepath.Join(dst, "sub", "nested.txt")); err != nil {
+		t.Error("sub/nested.txt was deleted, want it to be kept")
+	}
+}
+
+func TestRunMatchesTheFiltersAtTheTransferRoot(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeFile(t, filepath.Join(src, "top.txt"), "top")
+	writeFile(t, filepath.Join(src, "sub", "nested.txt"), "nested")
+
+	base := filepath.Base(src)
+	code := Run(context.Background(),
+		[]storage.Resolved{resolveSource(t, src)},
+		resolveDest(t, dst),
+		Options{
+			Recursive: true,
+			Rules:     []filter.Rule{{Kind: filter.Exclude, Pattern: base + "/sub"}},
+		},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+
+	if _, err := os.Stat(filepath.Join(dst, base, "top.txt")); err != nil {
+		t.Errorf("top.txt was not copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, base, "sub", "nested.txt")); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("sub/nested.txt was copied, want it to be filtered out")
+	}
+}
+
+func TestRunWritesTheDiagnosticsToStderr(t *testing.T) {
+	t.Parallel()
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(context.Background(),
+		[]storage.Resolved{{Endpoint: &brokenEndpoint{}, IsDir: true, Display: "src"}},
+		storage.Resolved{Endpoint: &brokenEndpoint{}, IsDir: true, Display: "dst"},
+		Options{},
+		stdout, stderr,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, want %d", code, CodePartial)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want it to be empty", stdout)
+	}
+	if !strings.Contains(stderr.String(), "cannot read") {
+		t.Errorf("stderr = %q, want it to hold the diagnostic", stderr)
+	}
+}
+
+func TestRunReportsFilesThatAreGone(t *testing.T) {
+	t.Parallel()
+
+	src := &goneEndpoint{files: map[string][]byte{"a.txt": []byte("hello")}}
+	dest := &goneEndpoint{files: map[string][]byte{}}
+
+	code := Run(context.Background(),
+		[]storage.Resolved{{Endpoint: src, IsDir: true, Display: "src"}},
+		storage.Resolved{Endpoint: dest, IsDir: true, Display: "dst"},
+		Options{Recursive: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeVanished {
+		t.Fatalf("Run() = %d, want %d", code, CodeVanished)
 	}
 }
 
@@ -318,7 +416,7 @@ func TestRunReportsVanishedFiles(t *testing.T) {
 		[]storage.Resolved{{Endpoint: src, IsDir: true, Display: "src"}},
 		storage.Resolved{Endpoint: dest, IsDir: true, Display: "dst"},
 		Options{Recursive: true},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeVanished {
 		t.Fatalf("Run() = %d, want %d", code, CodeVanished)
@@ -352,7 +450,7 @@ func TestRunWithTheMemoryDriver(t *testing.T) {
 		[]storage.Resolved{src},
 		dest,
 		Options{Recursive: true},
-		io.Discard,
+		io.Discard, io.Discard,
 	)
 	if code != CodeOK {
 		t.Fatalf("Run() = %d, want %d", code, CodeOK)
@@ -425,6 +523,69 @@ func readFile(t *testing.T, name string) string {
 		t.Fatalf("cannot read %s: %v", name, err)
 	}
 	return string(data)
+}
+
+// brokenEndpoint is an endpoint that cannot be listed.
+type brokenEndpoint struct{}
+
+// List always fails.
+func (e *brokenEndpoint) List(_ context.Context, _ string, _ func(storage.FileInfo) error) error {
+	return errors.New("the endpoint is broken")
+}
+
+// Open always fails.
+func (e *brokenEndpoint) Open(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, errors.New("the endpoint is broken")
+}
+
+// Create always fails.
+func (e *brokenEndpoint) Create(_ context.Context, _ string, _ time.Time, _ io.Reader) error {
+	return errors.New("the endpoint is broken")
+}
+
+// Delete always fails.
+func (e *brokenEndpoint) Delete(_ context.Context, _ string) error {
+	return errors.New("the endpoint is broken")
+}
+
+// goneEndpoint is an endpoint whose files are gone, the way an object that
+// was deleted in the bucket reports it.
+type goneEndpoint struct {
+	files map[string][]byte
+}
+
+// List calls fn for every file.
+func (e *goneEndpoint) List(_ context.Context, prefix string, fn func(storage.FileInfo) error) error {
+	for key, data := range e.files {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if err := fn(storage.FileInfo{Key: key, Size: int64(len(data))}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Open reports that the file is gone.
+func (e *goneEndpoint) Open(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("cannot read the object: %w", storage.ErrNotFound)
+}
+
+// Create writes a file.
+func (e *goneEndpoint) Create(_ context.Context, key string, _ time.Time, r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	e.files[key] = data
+	return nil
+}
+
+// Delete removes a file.
+func (e *goneEndpoint) Delete(_ context.Context, key string) error {
+	delete(e.files, key)
+	return nil
 }
 
 // vanishingEndpoint is an endpoint whose files disappear before they can be

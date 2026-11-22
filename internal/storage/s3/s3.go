@@ -6,6 +6,7 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -93,14 +94,22 @@ func (d *Driver) ResolveSource(ctx context.Context, loc storage.Location) (stora
 	case loc.Key == "":
 		// The whole bucket.
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket},
+			Endpoint: &endpoint{client: client, bucket: loc.Bucket, fetchModTime: true},
 			IsDir:    true,
 			Display:  display(loc),
 		}, nil
 	case loc.Trailing:
-		// A key prefix, without any further lookup.
+		// A key prefix. The prefix has to exist: a prefix that holds
+		// nothing would make a sync with --delete empty the destination.
+		exists, err := prefixExists(ctx, client, loc)
+		if err != nil {
+			return storage.Resolved{}, err
+		}
+		if !exists {
+			return storage.Resolved{}, fmt.Errorf("%w: s3://%s/%s", storage.ErrNotFound, loc.Bucket, loc.Key)
+		}
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: loc.Key},
+			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: loc.Key, fetchModTime: true},
 			IsDir:    true,
 			Display:  display(loc),
 		}, nil
@@ -123,7 +132,7 @@ func (d *Driver) ResolveSource(ctx context.Context, loc storage.Location) (stora
 			continue
 		}
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: prefix},
+			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: prefix, fetchModTime: true},
 			Name:     path.Base(loc.Key),
 			IsDir:    true,
 			Display:  display(loc),
@@ -139,13 +148,26 @@ func (d *Driver) ResolveSource(ctx context.Context, loc storage.Location) (stora
 			parent = loc.Key[:i+1]
 		}
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: parent},
+			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: parent, fetchModTime: true},
 			FileKey:  path.Base(loc.Key),
 			Display:  display(loc),
 		}, nil
 	}
 
 	return storage.Resolved{}, fmt.Errorf("%w: s3://%s/%s", storage.ErrNotFound, loc.Bucket, loc.Key)
+}
+
+// prefixExists reports whether a key prefix holds at least one object.
+func prefixExists(ctx context.Context, client *awss3.Client, loc storage.Location) (bool, error) {
+	out, err := client.ListObjectsV2(ctx, &awss3.ListObjectsV2Input{
+		Bucket:  aws.String(loc.Bucket),
+		Prefix:  aws.String(loc.Key),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return false, fmt.Errorf("cannot list s3://%s/%s: %w", loc.Bucket, loc.Key, err)
+	}
+	return len(out.Contents) > 0 || len(out.CommonPrefixes) > 0, nil
 }
 
 // ResolveDest resolves an s3:// destination location.
@@ -164,7 +186,7 @@ func (d *Driver) ResolveDest(ctx context.Context, loc storage.Location, singleFi
 				parent = prefix[:i+1]
 			}
 			return storage.Resolved{
-				Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: parent},
+				Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: parent, fetchModTime: true},
 				Name:     path.Base(prefix),
 				Display:  display(loc),
 			}, nil
@@ -173,7 +195,7 @@ func (d *Driver) ResolveDest(ctx context.Context, loc storage.Location, singleFi
 	}
 
 	return storage.Resolved{
-		Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: prefix},
+		Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: prefix, fetchModTime: true},
 		IsDir:    true,
 		Display:  display(loc),
 	}, nil
@@ -185,6 +207,15 @@ type endpoint struct {
 	bucket string
 	// prefix is the key prefix the endpoint is rooted at.
 	prefix string
+	// fetchModTime tells whether the listing looks up the modification
+	// time of every object it finds.
+	fetchModTime bool
+}
+
+// UseModTime tells the endpoint whether the modification times of the listed
+// objects matter.
+func (e *endpoint) UseModTime(enabled bool) {
+	e.fetchModTime = enabled
 }
 
 // key maps a key of the endpoint to the key of the bucket.
@@ -260,11 +291,20 @@ func (e *endpoint) info(ctx context.Context, objectKey, key string, object awss3
 		Checksum: aws.ToString(object.ETag),
 	}
 
+	if !e.fetchModTime {
+		return info, nil
+	}
+
 	// Object storage has no modification time of its own, so the time tong
 	// preserved is read back from the object metadata.
 	modTime, err := e.modTime(ctx, objectKey)
 	if err != nil {
-		return storage.FileInfo{}, err
+		if !isNotFound(err) {
+			return storage.FileInfo{}, err
+		}
+		// The object is gone already, so the listing time is good
+		// enough. The transfer reports it as a vanished file.
+		return info, nil
 	}
 	if !modTime.IsZero() {
 		info.ModTime = modTime
@@ -279,6 +319,9 @@ func (e *endpoint) modTime(ctx context.Context, key string) (time.Time, error) {
 		Key:    aws.String(key),
 	})
 	if err != nil {
+		if isNotFound(err) {
+			return time.Time{}, notFoundError(fmt.Errorf("cannot stat s3://%s/%s", e.bucket, key), err)
+		}
 		return time.Time{}, fmt.Errorf("cannot stat s3://%s/%s: %w", e.bucket, key, err)
 	}
 
@@ -300,6 +343,9 @@ func (e *endpoint) Open(ctx context.Context, key string) (io.ReadCloser, error) 
 		Key:    aws.String(e.key(key)),
 	})
 	if err != nil {
+		if isNotFound(err) {
+			return nil, notFoundError(fmt.Errorf("cannot read s3://%s/%s", e.bucket, e.key(key)), err)
+		}
 		return nil, fmt.Errorf("cannot read s3://%s/%s: %w", e.bucket, e.key(key), err)
 	}
 	return out.Body, nil
@@ -340,6 +386,21 @@ func (e *endpoint) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("cannot delete s3://%s/%s: %w", e.bucket, e.key(key), err)
 	}
 	return nil
+}
+
+// isNotFound reports whether an error means that the object is gone.
+func isNotFound(err error) bool {
+	if _, ok := errors.AsType[*awss3types.NoSuchKey](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[*awss3types.NotFound](err)
+	return ok
+}
+
+// notFoundError marks an error as the absence of an object, so that the
+// engine can tell a vanished file from a failed transfer.
+func notFoundError(message, err error) error {
+	return fmt.Errorf("%w: %w", message, errors.Join(storage.ErrNotFound, err))
 }
 
 // seekable returns a reader the SDK can compute a checksum of. A body that
