@@ -11,17 +11,18 @@ If you know `rsync`, you already know `tong`:
     tong -a --delete ./dist/ s3://example-bucket/dist/
 
 > [!WARNING]
-> tong is under active development. The CLI surface documented here is the
-> design goal for v0.1; flags and behavior may still change.
+> tong is under active development. The v0.1 CLI surface is implemented, but
+> the flags that are marked as planned below are rejected with a usage error
+> until they land.
 
 ## Supported storage
 
 tong is in early development, so nothing is checked off yet. Boxes are ticked
 as support lands; v0.1 targets local ⇄ Amazon S3.
 
-- [ ] Local filesystem — `/path`
-- [ ] Amazon S3 — `s3://bucket/key`
-- [ ] S3-compatible services — MinIO, Cloudflare R2, Backblaze B2, Wasabi, … (`s3://` + `--s3-endpoint`)
+- [x] Local filesystem — `/path`
+- [x] Amazon S3 — `s3://bucket/key`
+- [x] S3-compatible services — MinIO, Cloudflare R2, Backblaze B2, Wasabi, … (`s3://` + `--s3-endpoint`)
 - [ ] Google Cloud Storage — `gs://bucket/key`
 - [ ] Azure Blob Storage — `az://container/key`
 
@@ -54,17 +55,16 @@ file:
 
 - rsync-compatible interface: option names, combined short flags
   (`-avz`), and exit codes.
-- Incremental transfers: skip unchanged files by size + mtime, or force
-  full comparison with `--checksum`.
+- Incremental transfers: skip unchanged files by size + mtime.
 - Mirror remote trees with `--delete`, including `--dry-run` previews.
-- Include/exclude pattern filters (`--include`, `--exclude`, `
-  --exclude-from`).
+- Include/exclude pattern filters (`--include`, `--exclude`,
+  `--exclude-from`).
 - Size and time constraints (`--max-size`, `--min-size`, `--update`,
   `--existing`, `--ignore-existing`).
-- Parallel, resumable multipart uploads with bandwidth limiting
-  (`--bwlimit`).
-- Server-side copy when syncing bucket → bucket on the same provider.
-- Progress reporting with `-P`, machine-readable `--stats` output.
+- Planned for v0.2 and later: parallel, resumable multipart uploads with
+  bandwidth limiting (`--bwlimit`), server-side copy when syncing bucket →
+  bucket, progress reporting with `-P`, machine-readable `--stats` output
+  and checksum comparison with `-c`.
 
 ## Installation
 
@@ -107,7 +107,7 @@ Sync against an S3-compatible endpoint (MinIO, R2, B2, Wasabi, …):
 
 Filter what gets transferred:
 
-    tong -a --include '*.png' --include '*.jpg' --exclude '*' \
+    tong -a --include '*/' --include '*.png' --include '*.jpg' --exclude '*' \
         ./images/ s3://example-bucket/images/
 
 ## CLI
@@ -156,6 +156,42 @@ Deliberately not applicable to object storage: `-e/--rsh` (no shell transport),
 `--perms`/`--owner`/`--group`/`--devices`/`--links` (no POSIX metadata),
 daemon mode. tong exits with an error if it is given options it cannot honor.
 
+### rsync details worth knowing
+
+- **A trailing separator on the source decides what is copied.**
+  `tong -a ./dist/ s3://bucket/dist/` copies the *contents* of `./dist` into
+  `s3://bucket/dist/`, while `tong -a ./dist s3://bucket/dist/` copies the
+  *directory* `dist` into the destination, so the files end up in
+  `s3://bucket/dist/dist/`.
+- **A single source file is copied onto the destination itself.**
+  `tong a.txt b.txt` writes `b.txt`, and `tong a.txt s3://bucket/b.txt`
+  uploads the object `s3://bucket/b.txt`.
+- **The filters follow rsync, including its sharp edges.** The first rule
+  that matches a path wins, and an excluded directory takes its contents with
+  it. To copy only some file types from a whole tree, include the directories
+  as well:
+
+      tong -a --include '*/' --include '*.png' --exclude '*' ./images/ s3://example-bucket/images/
+
+  The patterns match the path of the file in the destination, which is the
+  transfer root of rsync: a source without a trailing separator keeps its own
+  name in that path, so `--exclude dist/sub` prunes `dist/sub` when
+  `dist` is the source.
+- **`--delete` needs `-r` or `-a`.** A sync that does not recurse does
+  not know what the destination should hold, so rsync refuses the
+  combination and so does tong.
+- **A source has to exist.** tong reports a missing source and leaves the
+  destination alone, instead of treating it as an empty directory that
+  `--delete` would empty.
+- **Modification times are preserved through object metadata.** tong stores
+  the modification time of a file in the `x-amz-meta-mtime` metadata of the
+  object, with the one second resolution that object storage offers.
+- **`-u` compares the preserved modification times.** The time an object
+  was uploaded is not the modification time of the file, so `--update` looks
+  at the preserved times, the same way `--times` does. Otherwise a file that
+  was uploaded long ago would look older than the copy on the destination
+  that was written from a newer source.
+
 ### Exit codes
 
 Exit codes follow rsync conventions so scripts written for rsync keep working:
@@ -185,7 +221,7 @@ shell history — and have them just work against a bucket.
 
 ## Roadmap
 
-- [ ] v0.1 — local ⇄ S3: core flags, `--dry-run`, `--delete`, filters, exit codes
+- [x] v0.1 — local ⇄ S3: core flags, `--dry-run`, `--delete`, filters, exit codes
 - [ ] v0.2 — `--stats`, `--bwlimit`, parallel uploads, `--remove-source-files`
 - [ ] v0.3 — Google Cloud Storage and Azure Blob Storage
 - [ ] v0.4 — cloud ⇄ cloud server-side copy, S3-compatible endpoints
@@ -207,6 +243,15 @@ Linting and formatting use golangci-lint v2:
 Install the pre-commit hook to format automatically before each commit:
 
     pre-commit install
+
+The tests of the S3 driver need a running S3 service and are skipped without
+one. Point them at any S3-compatible endpoint:
+
+    export TONG_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+    export TONG_TEST_S3_BUCKET=tong-test
+    export AWS_ACCESS_KEY_ID=minio
+    export AWS_SECRET_ACCESS_KEY=minio123
+    go test ./...
 
 ## Contributing
 
