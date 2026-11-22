@@ -173,6 +173,16 @@ daemon mode. tong exits with an error if it is given options it cannot honor.
 
       tong -a --include '*/' --include '*.png' --exclude '*' ./images/ s3://example-bucket/images/
 
+  The patterns match the path of the file in the destination, which is the
+  transfer root of rsync: a source without a trailing separator keeps its own
+  name in that path, so `--exclude dist/sub` prunes `dist/sub` when
+  `dist` is the source.
+- **`--delete` needs `-r` or `-a`.** A sync that does not recurse does
+  not know what the destination should hold, so rsync refuses the
+  combination and so does tong.
+- **A source has to exist.** tong reports a missing source and leaves the
+  destination alone, instead of treating it as an empty directory that
+  `--delete` would empty.
 - **Modification times are preserved through object metadata.** tong stores
   the modification time of a file in the `x-amz-meta-mtime` metadata of the
   object, with the one second resolution that object storage offers.
