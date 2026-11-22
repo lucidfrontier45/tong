@@ -1,0 +1,48 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+
+  settings:
+    gofumpt:
+      module-path: <your-project>
+      extra:
+        group-params: true
+        clothe-returns: true
+        balance-calls: true
+
+linters:
+  default: standard
+
+  enable:
+    # Modern Go
+    - modernize
+    - copyloopvar
+
+    # Code quality
+    - revive
+    - gocritic
+    - unconvert
+
+    # Error handling
+    - errorlint
+    - nilnesserr
+
+    # Security
+    - gosec
+
+    # HTTP
+    - bodyclose
+    - noctx
+
+  settings:
+    revive:
+      severity: warning
+
+    copyloopvar:
+      check-alias: false
+
+run:
+  timeout: 5m
