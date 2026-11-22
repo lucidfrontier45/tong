@@ -186,6 +186,11 @@ daemon mode. tong exits with an error if it is given options it cannot honor.
 - **Modification times are preserved through object metadata.** tong stores
   the modification time of a file in the `x-amz-meta-mtime` metadata of the
   object, with the one second resolution that object storage offers.
+- **`-u` compares the preserved modification times.** The time an object
+  was uploaded is not the modification time of the file, so `--update` looks
+  at the preserved times, the same way `--times` does. Otherwise a file that
+  was uploaded long ago would look older than the copy on the destination
+  that was written from a newer source.
 
 ### Exit codes
 

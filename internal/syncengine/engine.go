@@ -141,8 +141,8 @@ func useModTime(endpoint storage.Endpoint, enabled bool) {
 // addSource walks a source and collects the files that have to be copied.
 func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
 	// The modification times of the source only matter when they are
-	// preserved.
-	useModTime(src.Endpoint, p.opts.Times)
+	// compared or preserved.
+	useModTime(src.Endpoint, p.opts.Times || p.opts.Update)
 
 	if !src.IsDir {
 		info, err := lookup(ctx, src.Endpoint, src.FileKey)

@@ -423,6 +423,41 @@ func TestRunReportsVanishedFiles(t *testing.T) {
 	}
 }
 
+func TestRunComparesThePreservedTimesWhenItUpdates(t *testing.T) {
+	t.Parallel()
+
+	uploaded := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+	preserved := time.Date(2022, time.January, 1, 0, 0, 0, 0, time.UTC)
+	older := time.Date(2021, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	// The source was uploaded before the destination was written, but the
+	// modification time it preserved is the newer one.
+	source := &objectEndpoint{
+		files:    map[string][]byte{"a.txt": []byte("new content")},
+		modTimes: map[string]time.Time{"a.txt": preserved},
+		uploaded: uploaded,
+	}
+	dest := &objectEndpoint{
+		files:    map[string][]byte{"a.txt": []byte("old")},
+		modTimes: map[string]time.Time{"a.txt": older},
+		uploaded: uploaded,
+	}
+
+	code := Run(t.Context(),
+		[]storage.Resolved{{Endpoint: source, IsDir: true, Display: "s3://bucket/src/"}},
+		storage.Resolved{Endpoint: dest, IsDir: true, Display: "s3://bucket/dst/"},
+		Options{Recursive: true, Update: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+
+	if got := string(dest.files["a.txt"]); got != "new content" {
+		t.Errorf("a.txt = %q, want %q", got, "new content")
+	}
+}
+
 func TestRunWithTheMemoryDriver(t *testing.T) {
 	t.Parallel()
 
@@ -462,6 +497,73 @@ func TestRunWithTheMemoryDriver(t *testing.T) {
 	if got, ok := driver.Get("dst", "sub/b.txt"); !ok || string(got) != "world" {
 		t.Errorf("sub/b.txt = %q, want %q", got, "world")
 	}
+}
+
+// objectEndpoint mimics an object store: it reports the time a file was
+// uploaded, and the modification time that was preserved with it once the
+// caller asks for the times.
+type objectEndpoint struct {
+	files map[string][]byte
+	// modTimes holds the modification times that were preserved with the
+	// files.
+	modTimes map[string]time.Time
+	// uploaded is the time every file was uploaded at.
+	uploaded time.Time
+	// useModTime tells whether the preserved times are reported.
+	useModTime bool
+}
+
+// UseModTime tells the endpoint whether the modification times of the
+// listed files matter.
+func (e *objectEndpoint) UseModTime(enabled bool) {
+	e.useModTime = enabled
+}
+
+// List calls fn for every file.
+func (e *objectEndpoint) List(_ context.Context, prefix string, fn func(storage.FileInfo) error) error {
+	for key, data := range e.files {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		info := storage.FileInfo{Key: key, Size: int64(len(data)), ModTime: e.uploaded}
+		if e.useModTime {
+			if modTime, ok := e.modTimes[key]; ok {
+				info.ModTime = modTime
+			}
+		}
+		if err := fn(info); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Open returns the contents of a file.
+func (e *objectEndpoint) Open(_ context.Context, key string) (io.ReadCloser, error) {
+	data, ok := e.files[key]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, key)
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// Create writes a file.
+func (e *objectEndpoint) Create(_ context.Context, key string, modTime time.Time, r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	e.files[key] = data
+	if !modTime.IsZero() {
+		e.modTimes[key] = modTime
+	}
+	return nil
+}
+
+// Delete removes a file.
+func (e *objectEndpoint) Delete(_ context.Context, key string) error {
+	delete(e.files, key)
+	return nil
 }
 
 // resolveSource resolves a local source location.
