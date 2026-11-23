@@ -124,6 +124,9 @@ type plan struct {
 	// owners maps each planned destination entry to the source that
 	// provides it. Both collision detection and pruning use this map.
 	owners map[string]string
+	// moveSources protects every listed source identity, including files that
+	// filters, transfer options, or the self-move guard leave untouched.
+	moveSources map[string]string
 	// prune holds the destination keys to delete after the transfers.
 	prune []string
 	// collisions holds the destination keys that more than one source
@@ -227,6 +230,10 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 		limiter:   ratelimit.New(opts.BWLimit, nil),
 	}
 
+	if opts.RemoveSourceFiles {
+		p.moveSources = make(map[string]string)
+	}
+
 	for _, src := range sources {
 		if err := p.addSource(ctx, src); err != nil {
 			_, _ = fmt.Fprintf(stderr, "tong: cannot read %s: %v\n", src.Display, err)
@@ -266,8 +273,8 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 	return p.execute(ctx, stdout, stderr)
 }
 
-// checkOverlappingMove rejects a move that would overwrite a source planned
-// for removal through another source-to-destination mapping.
+// checkOverlappingMove rejects a move whose destination aliases any listed
+// source, even one that is skipped or explicitly protected from removal.
 func (p *plan) checkOverlappingMove(ctx context.Context) error {
 	if validator, ok := p.dest.Endpoint.(storage.MoveDestinationChecker); ok {
 		keys := make([]string, 0, len(p.items)+len(p.removals))
@@ -286,21 +293,6 @@ func (p *plan) checkOverlappingMove(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	sources := make(map[string]string)
-	for _, it := range p.items {
-		if identifier, ok := it.src.(storage.Identifier); ok {
-			if identity, err := identifier.Identity(ctx, it.srcKey); err == nil {
-				sources[identity] = it.srcDisplay
-			}
-		}
-	}
-	for _, r := range p.removals {
-		if identifier, ok := r.src.(storage.Identifier); ok {
-			if identity, err := identifier.Identity(ctx, r.key); err == nil {
-				sources[identity] = r.display
-			}
-		}
-	}
 	checks := make(map[string]string, len(p.items)+len(p.removals))
 	for _, it := range p.items {
 		checks[it.destKey] = it.srcDisplay
@@ -310,10 +302,13 @@ func (p *plan) checkOverlappingMove(ctx context.Context) error {
 	}
 	for destKey, display := range checks {
 		identity, err := destinations.Identity(ctx, destKey)
-		if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, storage.ErrNotFound) {
 			continue
 		}
-		if source, exists := sources[identity]; exists && source != display {
+		if err != nil {
+			return err
+		}
+		if source, exists := p.moveSources[identity]; exists {
 			return fmt.Errorf("%s is also the destination of %s", source, display)
 		}
 	}
@@ -366,6 +361,16 @@ func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
 // consider decides whether a source file has to be copied.
 func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, info storage.FileInfo) error {
 	destKey := p.destKey(src, key)
+	source := srcDisplay(src, key)
+	if p.moveSources != nil {
+		if identifier, ok := src.Endpoint.(storage.Identifier); ok {
+			identity, err := identifier.Identity(ctx, key)
+			if err != nil {
+				return fmt.Errorf("cannot identify source %s: %w", source, err)
+			}
+			p.moveSources[identity] = source
+		}
+	}
 
 	// The filters match the path of the file in the destination, which is
 	// the transfer root that rsync uses. A source without a trailing
@@ -380,7 +385,6 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 		return nil
 	}
 
-	source := srcDisplay(src, key)
 	ownerKey, err := p.destinationEntry(ctx, destKey)
 	if err != nil {
 		return fmt.Errorf("cannot identify destination %s: %w", p.destPath(destKey), err)
@@ -839,6 +843,17 @@ func (p *plan) deletions(ctx context.Context) ([]string, error) {
 		}
 		if _, planned := p.owners[entry]; planned {
 			continue
+		}
+		if p.moveSources != nil {
+			if identifier, ok := p.dest.Endpoint.(storage.Identifier); ok {
+				identity, err := identifier.Identity(ctx, key)
+				if err != nil {
+					return nil, err
+				}
+				if _, protected := p.moveSources[identity]; protected {
+					continue
+				}
+			}
 		}
 		keys = append(keys, key)
 	}

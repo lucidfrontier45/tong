@@ -1650,6 +1650,60 @@ func (e *beforeWriteEndpoint) Create(ctx context.Context, key string, modTime ti
 	return e.Endpoint.Create(ctx, key, modTime, r)
 }
 
+func TestMovePruneProtectsSkippedNestedSource(t *testing.T) {
+	t.Parallel()
+	dst := t.TempDir()
+	src := filepath.Join(dst, "inbox")
+	file := filepath.Join(src, "file")
+	writeFile(t, file, "only copy")
+	extra := filepath.Join(dst, "extra")
+	writeFile(t, extra, "prune me")
+	var stderr bytes.Buffer
+	code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, resolveDest(t, dst+"/"),
+		Options{Recursive: true, Existing: true, RemoveSourceFiles: true, Delete: true}, io.Discard, &stderr)
+	if code != CodeOK {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if got := readFile(t, file); got != "only copy" {
+		t.Fatalf("source holds %q", got)
+	}
+	for _, absent := range []string{extra, filepath.Join(dst, "file")} {
+		if _, err := os.Stat(absent); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("stat %s: %v; want absent", absent, err)
+		}
+	}
+}
+
+func TestMoveProtectsRefusedSourceFromAliasedDestination(t *testing.T) {
+	t.Parallel()
+	dst := t.TempDir()
+	protected := filepath.Join(dst, "Report")
+	alias := filepath.Join(dst, "report")
+	writeFile(t, protected, "original")
+	// On a case-sensitive volume, reproduce two planner keys with the same
+	// filesystem identity using a hard link.
+	if _, err := os.Stat(alias); errors.Is(err, fs.ErrNotExist) {
+		if err := os.Link(protected, alias); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	incoming := filepath.Join(t.TempDir(), "report")
+	writeFile(t, incoming, "incoming contents")
+	var stderr bytes.Buffer
+	code := Run(t.Context(), []storage.Resolved{resolveSource(t, protected), resolveSource(t, incoming)}, resolveDest(t, dst+"/"),
+		Options{RemoveSourceFiles: true}, io.Discard, &stderr)
+	if code != CodeUsage {
+		t.Fatalf("exit %d: %s; want refusal before writing", code, stderr.String())
+	}
+	for file, want := range map[string]string{protected: "original", alias: "original", incoming: "incoming contents"} {
+		if got := readFile(t, file); got != want {
+			t.Errorf("%s holds %q, want %q", file, got, want)
+		}
+	}
+}
+
 func TestMoveToNewLocalNames(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
