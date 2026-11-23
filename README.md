@@ -55,7 +55,8 @@ file:
 
 - rsync-compatible interface: option names, combined short flags
   (`-avz`), and exit codes.
-- Incremental transfers: skip unchanged files by size + mtime.
+- Incremental transfers: skip unchanged files by size (and by mtime with
+  `-t` or `--update`; see [rsync compatibility](#rsync-compatibility)).
 - Mirror remote trees with `--delete`, including `--dry-run` previews.
 - Include/exclude pattern filters (`--include`, `--exclude`,
   `--exclude-from`).
@@ -151,7 +152,7 @@ argument is a source. Sources and destinations are URLs:
 | `--max-size SIZE`   | Don't transfer files larger than SIZE                  |
 | `--min-size SIZE`   | Don't transfer files smaller than SIZE                 |
 | `--parallel N`      | Transfer up to N files at a time (default 4; a tong extension, rsync transfers a single stream) |
-| `--bwlimit KBPS`    | Limit I/O bandwidth, KiB/s                             |
+| `--bwlimit RATE`    | Limit I/O bandwidth (rsync's rate grammar, see below)  |
 | `-P`                | Same as `--partial --progress`                         |
 | `--stats`           | Print a transfer summary as `key=value` lines          |
 | `--remove-source-files` | Delete source files that are in sync with the destination (one-way move) |
@@ -194,22 +195,30 @@ daemon mode. tong exits with an error if it is given options it cannot honor.
   the modification time of a file in the `x-amz-meta-mtime` metadata of the
   object, with the one second resolution that object storage offers.
 - **Multipart uploads are planned from the listing.** A file larger than
-  16 MiB goes up in parts of at least 16 MiB, as many at a time as
-  `--parallel` allows, and the size tong knows from the listing lets the part
-  size grow, so a single object may be as large as S3 allows. An upload that
-  fails aborts its parts instead of leaving them in the bucket.
-- **`--bwlimit` is one budget for the whole run.** The number is in KiB per
-  second, with an optional `K`, `M` or `G` suffix, and `0` means no limit,
-  the way rsync counts it. Unlike rsync, the budget is shared by every worker
-  and by the parts of a multipart upload, so `--parallel 8 --bwlimit 1M` still
-  moves about 1 MiB/s in total. Throttling happens on the source, so it holds
-  for local → S3, S3 → local and S3 → S3 alike.
+  16 MiB goes up in parts of at least 16 MiB, and the size tong knows from the
+  listing lets the part size grow, so a single object may be as large as S3
+  allows. An upload that fails aborts its parts instead of leaving them in the
+  bucket.
+- **`--bwlimit` takes rsync's rate grammar.** The value is a rate per second:
+  a bare number is KiB/s, so `--bwlimit 100` means 100 KiB/s. Suffixes follow
+  `--max-size`: `B`, `K`, `M`, `G`, `T` or `P`, where a single letter or a
+  `…iB` form is a multiple of 1024 and a two-letter form ending in `B` is a
+  multiple of 1000 — so `1K` and `1KiB` are 1024 B/s while `1KB` is 1000 B/s.
+  Fractions work (`1.5m`), letters are case-insensitive, and `0` means no
+  limit. Unlike rsync, the budget is shared by every worker and by the parts
+  of a multipart upload, so `--parallel 8 --bwlimit 1M` still moves about
+  1 MiB/s in total. Throttling happens on the source, so it holds for
+  local → S3, S3 → local and S3 → S3 alike.
 - **`--remove-source-files` removes what is in sync, not only what was
   copied.** A source file that the destination already holds is removed as
   well, because it is in sync either way. Files that `--ignore-existing`,
   `--update` or a filter leaves out stay where they are, directories are
   never removed, and nothing is removed during a `--dry-run` or when the
-  transfer fails.
+  transfer fails. Because removal loses data, a move is stricter than a copy:
+  the modification times are compared even without `-t`, a source is only
+  removed if it still matches what was listed, and a source that resolves to
+  the destination itself is left alone. See
+  [rsync compatibility](#rsync-compatibility).
 - **`--stats` prints `key=value` lines, not rsync's summary block.** The
   keys are stable, so a script can read them with `grep` or `awk`:
 
@@ -243,8 +252,64 @@ Exit codes follow rsync conventions so scripts written for rsync keep working:
 | 1    | Syntax or usage error                        |
 | 2    | Protocol incompatibility                     |
 | 3    | Errors selecting input/output files          |
+| 20   | Received `SIGINT`/`SIGTERM` mid-run (see [rsync compatibility](#rsync-compatibility)) |
 | 23   | Partial transfer due to error                |
 | 24   | Source files vanished before transfer        |
+
+## rsync compatibility
+
+tong aims at rsync's CLI, not at byte-for-byte conformance. The table below
+records every place where behaviour was decided explicitly against rsync
+3.5.0, because the two tools can disagree there. Rows marked *same* are
+verified identical; the rest are deliberate divergences. Behaviour is checked
+against the binary rather than against the man page.
+
+| Area | rsync | tong | Status |
+| --- | --- | --- | --- |
+| `--parallel` | no such option (single stream) | transfers up to N files at once | shipped |
+| `--bwlimit` scope | one budget per stream | one budget for the whole run, workers and multipart parts included | shipped |
+| `--bwlimit` bare number | KiB/s | same | shipped |
+| `--stats` output | multi-line summary block | stable `key=value` lines | shipped |
+| Default quick check | size **and** mtime | size only (no extra request per object) | shipped |
+| `--bwlimit` suffixes | `B/K/M/G/T/P`, `…iB` = 1024, `…B` = 1000, fractions | same grammar | decided |
+| `--bwlimit` rounding | rounds to whole KiB, minimum 512 B/s | keeps the exact rate, no floor above 0 | decided |
+| Quick check in move mode | size **and** mtime | size and mtime, even without `-t` | decided |
+| `--remove-source-files` and mtime | compares mtimes, does not preserve them without `-t` | same | decided |
+| Two sources, one destination key | last one wins, silently; both sources removed | copy: last one wins, deterministic. move: refused before anything is written or deleted | decided |
+| Source equal to destination | transfer skipped, source kept, exit 23 | same | decided |
+| Source replaced after listing | refuses to remove the changed file | removes only if it still matches the listing | decided |
+| Multipart part concurrency | n/a | fixed, independent of `--parallel` | decided |
+| `SIGINT`/`SIGTERM` | stops, exits 20, keeps sources | same | decided |
+
+**Status column.** `shipped` behaviour is what the binary does today. `decided`
+marks behaviour that has been agreed but not implemented yet; it is recorded
+here so the intent is fixed before the code changes, and each row becomes
+`shipped` with the change that implements it.
+
+**Why the default quick check is size-only.** rsync compares size and mtime,
+but on object storage an mtime comparison costs one `HeadObject` per object,
+which is what `--times` and `--update` already pay for and what a plain copy
+avoids. tong therefore treats a size match as "in sync" unless an option asks
+for the time. This is a real divergence: with equal sizes and different
+mtimes, rsync rewrites the destination and tong leaves it alone. Pass `-t` or
+`--update` to get rsync's behaviour.
+
+**Why a move is stricter than a copy.** Removing a source is the only
+operation here that can lose data, so the decisions above trade tolerance for
+safety: mtimes are compared even without `-t`, a source is deleted only after
+the engine confirms it still matches the listing it planned from, and a source
+that resolves to the destination itself — including through a symlink — is
+left in place with exit 23 instead of being deleted. Today tong removes an
+in-sync source without either guard, so a move can delete a file that the
+destination does not hold; the guards land with the change that makes those
+rows `shipped`, and until then a move should be treated as data-destructive.
+
+**Why part concurrency is not `--parallel`.** The SDK allocates
+`Concurrency+1` part buffers per object, so tying part concurrency to the
+file-level knob would multiply memory twice. `--parallel` is a file-level
+setting only, and the part concurrency is a fixed value in the driver. Peak
+buffering stays around `--parallel × (part concurrency + 1) × part size`,
+which is why the part size is not larger than it has to be.
 
 ## How tong compares
 
