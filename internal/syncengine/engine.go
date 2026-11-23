@@ -511,7 +511,8 @@ func (p *plan) execute(ctx context.Context, stdout, stderr io.Writer) int {
 	}
 
 	failed, vanished := 0, 0
-	for _, err := range p.transferAll(ctx, stdout, stderr) {
+	results := p.transferAll(ctx, stdout, stderr)
+	for _, err := range results {
 		switch {
 		case err == nil:
 		case errors.Is(err, fs.ErrNotExist), errors.Is(err, storage.ErrNotFound):
@@ -533,6 +534,45 @@ func (p *plan) execute(ctx context.Context, stdout, stderr io.Writer) int {
 	if err := ctx.Err(); err != nil {
 		p.report(stdout)
 		return CodeSignal
+	}
+
+	if p.opts.RemoveSourceFiles {
+		if checker, ok := p.dest.Endpoint.(storage.MoveResultChecker); ok {
+			keys := make([]string, 0, len(p.items)+len(p.removals)+len(p.prune))
+			for i, it := range p.items {
+				if results[i] == nil {
+					keys = append(keys, it.destKey)
+				}
+			}
+			for _, r := range p.removals {
+				keys = append(keys, r.destKey)
+			}
+			keys = append(keys, p.prune...)
+			if err := checker.CheckMoveResults(ctx, keys); err != nil {
+				p.stats.errors.Add(1)
+				p.print(stderr, "tong: leaving sources and destination entries in place: %v\n", err)
+				p.report(stdout)
+				if ctx.Err() != nil {
+					return CodeSignal
+				}
+				return CodePartial
+			}
+			for i, it := range p.items {
+				if ctx.Err() != nil {
+					break
+				}
+				if results[i] != nil {
+					continue
+				}
+				if err := deleteSource(ctx, it.src, it.srcKey, it.info); err != nil {
+					p.stats.errors.Add(1)
+					p.print(stderr, "tong: %v\n", err)
+					failed++
+				} else {
+					p.stats.removed.Add(1)
+				}
+			}
+		}
 	}
 
 	// A file that is already in sync is removed as well, because
@@ -614,7 +654,7 @@ func (p *plan) transfer(ctx context.Context, it item, stdout, stderr io.Writer) 
 	p.stats.transferred.Add(1)
 	p.stats.bytes.Add(bytesRead)
 
-	if p.opts.RemoveSourceFiles {
+	if _, deferred := p.dest.Endpoint.(storage.MoveResultChecker); p.opts.RemoveSourceFiles && !deferred {
 		// A cancelled run removes nothing, even a file whose copy made it
 		// through, because the caller asked the whole move to stop.
 		if err := ctx.Err(); err != nil {

@@ -306,10 +306,13 @@ refused with exit 1 before anything is written or deleted.
 
 **How a move checks a source before removing it.** A local file is compared by
 size, modification time, and filesystem identity, so replacing it with a
-same-size, same-mtime file is detected. The comparison happens on an open
-handle, and the checked file is moved to a private name before it is
-unlinked, so a producer that renames a replacement onto the source during the
-check cannot lose its file; such a run keeps the source and exits 23. A local
+same-size, same-mtime file is detected. Tong moves the entry to a private
+directory on the same filesystem, then checks it before unlinking it. If it
+changed, tong restores it without overwriting a newer arrival. If restoration
+is not possible, tong exits 23 and prints the staged file's recovery path.
+For moves to local storage, tong also checks the completed destinations
+before deleting any source: if the filesystem resolves two planned names
+to one file, copies may have been written, but both sources are retained. A local
 move still expects nothing to rewrite the source while it is being read; a
 source that changes during a transfer is detected before it is removed. S3
 removal uses an atomic conditional delete on the listed ETag. Source removal

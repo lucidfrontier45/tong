@@ -1650,6 +1650,30 @@ func (e *beforeWriteEndpoint) Create(ctx context.Context, key string, modTime ti
 	return e.Endpoint.Create(ctx, key, modTime, r)
 }
 
+func TestMoveToNewLocalNames(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "probe"), "")
+	_, err := os.Stat(filepath.Join(dir, "PROBE"))
+	folded := err == nil
+	if !folded && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
+	}
+	driver := memory.New()
+	for _, key := range []string{"Report", "report"} {
+		driver.Put("src", key, []byte(key), time.Now())
+	}
+	code := Run(t.Context(), []storage.Resolved{memorySource(t, driver, "src/")}, resolveDest(t, dir+"/"),
+		Options{Recursive: true, RemoveSourceFiles: true, Parallel: 2}, io.Discard, io.Discard)
+	if folded {
+		if code != CodePartial || len(driver.Keys("src")) != 2 {
+			t.Fatalf("aliased move: exit %d, remaining %v", code, driver.Keys("src"))
+		}
+	} else if code != CodeOK || len(driver.Keys("src")) != 0 {
+		t.Fatalf("distinct move: exit %d, remaining %v", code, driver.Keys("src"))
+	}
+}
+
 func TestRunStopsRemovingWhenCancelled(t *testing.T) {
 	t.Parallel()
 

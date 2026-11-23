@@ -149,6 +149,12 @@ type MoveDestinationChecker interface {
 	CheckMoveDestinations(ctx context.Context, keys []string) error
 }
 
+// MoveResultChecker validates the identities of completed destinations and
+// prune candidates before the engine removes any source or destination.
+type MoveResultChecker interface {
+	CheckMoveResults(ctx context.Context, keys []string) error
+}
+
 // SourceRemovalChecker rejects source removal when the endpoint cannot do it safely.
 type SourceRemovalChecker interface {
 	// CheckSourceRemoval checks whether the endpoint permits source removal.
