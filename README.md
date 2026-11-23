@@ -55,8 +55,8 @@ file:
 
 - rsync-compatible interface: option names, combined short flags
   (`-avz`), and exit codes.
-- Incremental transfers: skip unchanged files by size (and by mtime with
-  `-t` or `--update`; see [rsync compatibility](#rsync-compatibility)).
+- Incremental transfers: skip unchanged files by size, and by mtime with
+  `-t`, `--update` or a move (see [rsync compatibility](#rsync-compatibility)).
 - Mirror remote trees with `--delete`, including `--dry-run` previews.
 - Include/exclude pattern filters (`--include`, `--exclude`,
   `--exclude-from`).
@@ -195,29 +195,33 @@ daemon mode. tong exits with an error if it is given options it cannot honor.
   the modification time of a file in the `x-amz-meta-mtime` metadata of the
   object, with the one second resolution that object storage offers.
 - **Multipart uploads are planned from the listing.** A file larger than
-  16 MiB goes up in parts of at least 16 MiB, and the size tong knows from the
-  listing lets the part size grow, so a single object may be as large as S3
-  allows. An upload that fails aborts its parts instead of leaving them in the
-  bucket.
+  16 MiB goes up in parts of at least 16 MiB, four at a time, and the size
+  tong knows from the listing lets the part size grow, so a single object may
+  be as large as S3 allows. The number of parts in flight is fixed rather than
+  taken from `--parallel`; see
+  [rsync compatibility](#rsync-compatibility). An upload that fails aborts its
+  parts instead of leaving them in the bucket.
 - **`--bwlimit` takes rsync's rate grammar.** The value is a rate per second:
-  a bare number is KiB/s, so `--bwlimit 100` means 100 KiB/s. Suffixes follow
-  `--max-size`: `B`, `K`, `M`, `G`, `T` or `P`, where a single letter or a
-  `…iB` form is a multiple of 1024 and a two-letter form ending in `B` is a
-  multiple of 1000 — so `1K` and `1KiB` are 1024 B/s while `1KB` is 1000 B/s.
-  Fractions work (`1.5m`), letters are case-insensitive, and `0` means no
-  limit. Unlike rsync, the budget is shared by every worker and by the parts
-  of a multipart upload, so `--parallel 8 --bwlimit 1M` still moves about
-  1 MiB/s in total. Throttling happens on the source, so it holds for
-  local → S3, S3 → local and S3 → S3 alike.
+  a bare number is KiB/s, so `--bwlimit 100` means 100 KiB/s. The suffixes are
+  rsync's size suffixes: `B`, `K`, `M`, `G`, `T` or `P`, where a single letter
+  or a `…iB` form is a multiple of 1024 and a two-letter form ending in `B` is
+  a multiple of 1000 — so `1K` and `1KiB` are 1024 B/s while `1KB` is
+  1000 B/s. Fractions work (`1.5m`), letters are case-insensitive, and `0`
+  means no limit. A positive value that works out to zero bytes per second is
+  a usage error rather than a limit that quietly disappears. Unlike rsync, the
+  budget is shared by every worker and by the parts of a multipart upload, so
+  `--parallel 8 --bwlimit 1M` still moves about 1 MiB/s in total. Throttling
+  happens on the source, so it holds for local → S3, S3 → local and S3 → S3
+  alike.
 - **`--remove-source-files` removes what is in sync, not only what was
   copied.** A source file that the destination already holds is removed as
   well, because it is in sync either way. Files that `--ignore-existing`,
   `--update` or a filter leaves out stay where they are, directories are
-  never removed, and nothing is removed during a `--dry-run` or when the
-  transfer fails. Because removal loses data, a move is stricter than a copy:
-  the modification times are compared even without `-t`, a source is only
-  removed if it still matches what was listed, and a source that resolves to
-  the destination itself is left alone. See
+  never removed, and nothing is removed during a `--dry-run`, after a failed
+  transfer, or once the run has been interrupted. Because removal loses data,
+  a move is stricter than a copy: the modification times are compared even
+  without `-t`, a source is only removed if it still matches what was listed,
+  and a source that resolves to the destination itself is left alone. See
   [rsync compatibility](#rsync-compatibility).
 - **`--stats` prints `key=value` lines, not rsync's summary block.** The
   keys are stable, so a script can read them with `grep` or `awk`:
@@ -249,7 +253,7 @@ Exit codes follow rsync conventions so scripts written for rsync keep working:
 | Code | Meaning                                      |
 | ---- | -------------------------------------------- |
 | 0    | Success                                      |
-| 1    | Syntax or usage error                        |
+| 1    | Syntax or usage error, including an ambiguous move |
 | 2    | Protocol incompatibility                     |
 | 3    | Errors selecting input/output files          |
 | 20   | Received `SIGINT`/`SIGTERM` mid-run (see [rsync compatibility](#rsync-compatibility)) |
@@ -264,27 +268,22 @@ records every place where behaviour was decided explicitly against rsync
 verified identical; the rest are deliberate divergences. Behaviour is checked
 against the binary rather than against the man page.
 
-| Area | rsync | tong | Status |
-| --- | --- | --- | --- |
-| `--parallel` | no such option (single stream) | transfers up to N files at once | shipped |
-| `--bwlimit` scope | one budget per stream | one budget for the whole run, workers and multipart parts included | shipped |
-| `--bwlimit` bare number | KiB/s | same | shipped |
-| `--stats` output | multi-line summary block | stable `key=value` lines | shipped |
-| Default quick check | size **and** mtime | size only (no extra request per object) | shipped |
-| `--bwlimit` suffixes | `B/K/M/G/T/P`, `…iB` = 1024, `…B` = 1000, fractions | same grammar | decided |
-| `--bwlimit` rounding | rounds to whole KiB, minimum 512 B/s | keeps the exact rate, no floor above 0 | decided |
-| Quick check in move mode | size **and** mtime | size and mtime, even without `-t` | decided |
-| `--remove-source-files` and mtime | compares mtimes, does not preserve them without `-t` | same | decided |
-| Two sources, one destination key | last one wins, silently; both sources removed | copy: last one wins, deterministic. move: refused before anything is written or deleted | decided |
-| Source equal to destination | transfer skipped, source kept, exit 23 | same | decided |
-| Source replaced after listing | refuses to remove the changed file | removes only if it still matches the listing | decided |
-| Multipart part concurrency | n/a | fixed, independent of `--parallel` | decided |
-| `SIGINT`/`SIGTERM` | stops, exits 20, keeps sources | same | decided |
-
-**Status column.** `shipped` behaviour is what the binary does today. `decided`
-marks behaviour that has been agreed but not implemented yet; it is recorded
-here so the intent is fixed before the code changes, and each row becomes
-`shipped` with the change that implements it.
+| Area | rsync | tong |
+| --- | --- | --- |
+| `--parallel` | no such option (single stream) | transfers up to N files at once |
+| `--bwlimit` scope | one budget per stream | one budget for the whole run, workers and multipart parts included |
+| `--bwlimit` bare number | KiB/s | same |
+| `--bwlimit` suffixes | `B/K/M/G/T/P`, `…iB` = 1024, `…B` = 1000, fractions | same |
+| `--bwlimit` rounding | rounds to whole KiB, minimum 512 B/s | keeps the exact rate, no floor above 0, rejects a positive rate that resolves to zero |
+| `--stats` output | multi-line summary block | stable `key=value` lines |
+| Default quick check | size **and** mtime | size only (no extra request per object) |
+| Quick check in move mode | size **and** mtime | size and mtime |
+| `--remove-source-files` and mtime | compares mtimes, does not preserve them without `-t` | same |
+| Two sources, one destination key | first source wins; the other source is left alone | copy: same. move: refused with exit 1 before anything is written or deleted |
+| Source equal to destination | refuses to remove, exit 23 | same |
+| Source replaced after listing | refuses to remove the changed file, exit 23 | same |
+| Multipart part concurrency | n/a | fixed, independent of `--parallel` |
+| `SIGINT`/`SIGTERM` | stops, exits 20, keeps sources | same |
 
 **Why the default quick check is size-only.** rsync compares size and mtime,
 but on object storage an mtime comparison costs one `HeadObject` per object,
@@ -292,17 +291,24 @@ which is what `--times` and `--update` already pay for and what a plain copy
 avoids. tong therefore treats a size match as "in sync" unless an option asks
 for the time. This is a real divergence: with equal sizes and different
 mtimes, rsync rewrites the destination and tong leaves it alone. Pass `-t` or
-`--update` to get rsync's behaviour.
+`--update` to get rsync's behaviour. A move always compares the times, because
+a size match alone is not enough evidence to delete the source.
 
 **Why a move is stricter than a copy.** Removing a source is the only
-operation here that can lose data, so the decisions above trade tolerance for
-safety: mtimes are compared even without `-t`, a source is deleted only after
-the engine confirms it still matches the listing it planned from, and a source
-that resolves to the destination itself — including through a symlink — is
-left in place with exit 23 instead of being deleted. Today tong removes an
-in-sync source without either guard, so a move can delete a file that the
-destination does not hold; the guards land with the change that makes those
-rows `shipped`, and until then a move should be treated as data-destructive.
+operation here that can lose data, so a move adds two guards: it compares
+mtimes even without `-t`, and it deletes a source only after confirming that
+the file still matches the listing it planned from. A source that resolves to
+the destination itself — including through a symlink — is left in place with
+exit 23, and two sources that would write one destination key are refused with
+exit 1 before anything is written or deleted.
+
+**How a move checks a source before removing it.** A local file is compared by
+size and modification time, an S3 object by its ETag. The check is a request
+of its own rather than an atomic conditional delete, because the
+S3-compatible services tong targets do not all implement conditional deletes;
+the window between the check and the delete is therefore the same one rsync
+has. A source that changed in that window, or between the listing and the
+removal, is kept and the run exits 23.
 
 **Why part concurrency is not `--parallel`.** The SDK allocates
 `Concurrency+1` part buffers per object, so tying part concurrency to the
@@ -316,7 +322,7 @@ which is why the part size is not larger than it has to be.
 |                        | rsync            | rclone                | tong       |
 | ---------------------- | ---------------- | --------------------- | ---------- |
 | rsync CLI compatible   | yes              | no                    | **yes**    |
-| Cloud object storage   | no               | yes                   | planned — S3 first |
+| Cloud object storage   | no               | yes                   | **yes** — local, S3 and S3-compatible services |
 | POSIX metadata (perms, ownership, symlinks) | yes | partial | no (object storage semantics) |
 | Config file required   | no               | yes                   | **no**     |
 | Delta (rolling-checksum) transfer | yes   | no                    | planned    |
@@ -330,7 +336,7 @@ shell history — and have them just work against a bucket.
 - [x] v0.1 — local ⇄ S3: core flags, `--dry-run`, `--delete`, filters, exit codes
 - [x] v0.2 — parallel transfers (`--parallel`), multipart uploads beyond 5 GB, `--bwlimit`, `--remove-source-files`, `--stats`
 - [ ] v0.3 — Google Cloud Storage and Azure Blob Storage
-- [ ] v0.4 — cloud ⇄ cloud server-side copy, S3-compatible endpoints
+- [ ] v0.4 — cloud ⇄ cloud server-side copy
 - [ ] v0.5 — checksum-based comparison (`-c`) using provider checksum APIs
 - [ ] v1.0 — stable CLI contract, delta transfer for large files
 
