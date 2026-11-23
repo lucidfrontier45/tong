@@ -100,7 +100,7 @@ func TestRunAppliesTheNewOptions(t *testing.T) {
 	}
 }
 
-func TestParseBWLimit(t *testing.T) {
+func TestParseRate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -109,26 +109,41 @@ func TestParseBWLimit(t *testing.T) {
 	}{
 		{value: "", want: 0},
 		{value: "0", want: 0},
+		// A bare number is KiB per second.
 		{value: "100", want: 100 * 1024},
-		{value: "1.5K", want: 1536 * 1024},
-		{value: "2M", want: 2 * 1024 * 1024 * 1024},
+		{value: "1.5", want: 1536},
+		// A single letter or the "iB" form scales by 1024.
+		{value: "1K", want: 1 << 10},
+		{value: "1k", want: 1 << 10},
+		{value: "1KiB", want: 1 << 10},
+		{value: "1kib", want: 1 << 10},
+		{value: "1.5K", want: 1536},
+		{value: "2M", want: 2 << 20},
+		{value: "1G", want: 1 << 30},
+		{value: "1T", want: 1 << 40},
+		// A two-letter form ending in B scales by 1000.
+		{value: "1KB", want: 1000},
+		{value: "1MB", want: 1000 * 1000},
+		// A rate is exact, so it may be smaller than one KiB.
+		{value: "1B", want: 1},
+		{value: "0.5", want: 512},
 	}
 	for _, tc := range tests {
-		got, err := parseBWLimit(tc.value)
+		got, err := parseRate(tc.value)
 		if err != nil {
-			t.Errorf("parseBWLimit(%q) = %v", tc.value, err)
+			t.Errorf("parseRate(%q) = %v", tc.value, err)
 			continue
 		}
 		if got != tc.want {
-			t.Errorf("parseBWLimit(%q) = %d, want %d", tc.value, got, tc.want)
+			t.Errorf("parseRate(%q) = %d, want %d", tc.value, got, tc.want)
 		}
 	}
 
-	// The value is in KiB, so a size that fits into an int64 as bytes but
-	// not as KiB per second is still too large.
-	for _, value := range []string{"big", "-1", "9223372036854775807", "9007199254740991K"} {
-		if _, err := parseBWLimit(value); err == nil {
-			t.Errorf("parseBWLimit(%q) = nil, want an error", value)
+	// A rate that is asked for but rounds away would mean "no limit", and a
+	// malformed or overflowing rate is refused.
+	for _, value := range []string{"big", "-1", "1E", "1x", "1.5.5", "0.0001", "9223372036854775807"} {
+		if _, err := parseRate(value); err == nil {
+			t.Errorf("parseRate(%q) = nil, want an error", value)
 		}
 	}
 }

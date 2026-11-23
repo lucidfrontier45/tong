@@ -118,7 +118,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "tong: --min-size: %v\n", err)
 		return syncengine.CodeUsage
 	}
-	bwLimit, err := parseBWLimit(opts.BWLimit)
+	bwLimit, err := parseRate(opts.BWLimit)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "tong: --bwlimit: %v\n", err)
 		return syncengine.CodeUsage
@@ -249,15 +249,102 @@ func parseSize(value string) (int64, error) {
 	return size, nil
 }
 
-// parseBWLimit parses --bwlimit, which rsync writes in KiB per second with
-// an optional K, M or G suffix. Zero means no limit.
-func parseBWLimit(value string) (int64, error) {
-	kib, err := parseSize(value)
+// rateUnits holds the multipliers of the suffixes of a rate. rsync reads a
+// single letter or the "iB" form as a multiple of 1024 and a two-letter form
+// ending in "B" as a multiple of 1000, and tong follows it.
+var rateUnits = map[byte]struct {
+	binary  int64
+	decimal int64
+}{
+	'B': {1, 1},
+	'K': {1 << 10, 1000},
+	'M': {1 << 20, 1000 * 1000},
+	'G': {1 << 30, 1000 * 1000 * 1000},
+	'T': {1 << 40, 1000 * 1000 * 1000 * 1000},
+	'P': {1 << 50, 1000 * 1000 * 1000 * 1000 * 1000},
+}
+
+// parseRate parses a rate such as "100", "1.5m" or "1KiB".
+//
+// The grammar is rsync's --bwlimit grammar: a bare number is KiB per second,
+// a suffix scales it, fractions are allowed and 0 means no limit. Unlike
+// rsync, the rate is kept exact instead of being rounded to whole KiB, so
+// --bwlimit 1 stays meaningful.
+func parseRate(value string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+
+	end := strings.IndexFunc(value, func(r rune) bool {
+		return (r < '0' || r > '9') && r != '.'
+	})
+	if end < 0 {
+		end = len(value)
+	}
+	digits, suffix := value[:end], value[end:]
+	if !sizePattern.MatchString(digits) {
+		return 0, fmt.Errorf("invalid rate %q", value)
+	}
+
+	multiplier, err := rateMultiplier(suffix)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("invalid rate %q: %w", value, err)
 	}
-	if kib > math.MaxInt64/1024 {
-		return 0, fmt.Errorf("size %q is too large", value)
+
+	whole, fraction, _ := strings.Cut(digits, ".")
+	number, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("rate %q is too large", value)
+		}
+		return 0, fmt.Errorf("invalid rate %q", value)
 	}
-	return kib * 1024, nil
+
+	// The scaled number has to leave room for the fraction.
+	if number > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("rate %q is too large", value)
+	}
+	rate := number * multiplier
+
+	if fraction != "" {
+		part, err := strconv.ParseFloat("0."+fraction, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid rate %q", value)
+		}
+		extra := int64(math.Round(part * float64(multiplier)))
+		if rate > math.MaxInt64-extra {
+			return 0, fmt.Errorf("rate %q is too large", value)
+		}
+		rate += extra
+	}
+
+	// A rate that is asked for but rounds away would silently mean "no
+	// limit", which is the opposite of what the caller asked for.
+	if rate == 0 && strings.Trim(digits, "0.") != "" {
+		return 0, fmt.Errorf("rate %q is too small", value)
+	}
+	return rate, nil
+}
+
+// rateMultiplier returns the multiplier of a rate suffix. An empty suffix
+// means KiB, the way rsync reads a bare number.
+func rateMultiplier(suffix string) (int64, error) {
+	if suffix == "" {
+		return 1 << 10, nil
+	}
+
+	upper := strings.ToUpper(suffix)
+	unit, ok := rateUnits[upper[0]]
+	if !ok {
+		return 0, fmt.Errorf("unknown suffix %q", suffix)
+	}
+	switch {
+	case len(upper) == 1:
+		return unit.binary, nil
+	case len(upper) == 2 && upper[1] == 'B':
+		return unit.decimal, nil
+	case len(upper) == 3 && upper[1] == 'I' && upper[2] == 'B':
+		return unit.binary, nil
+	}
+	return 0, fmt.Errorf("unknown suffix %q", suffix)
 }
