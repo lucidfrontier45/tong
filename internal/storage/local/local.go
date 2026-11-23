@@ -162,11 +162,14 @@ type endpoint struct {
 
 // resolve maps a key to a path inside the endpoint root.
 func (e *endpoint) resolve(key string) (string, error) {
-	full := filepath.Join(e.root, filepath.FromSlash(key))
-	if full != e.root && !strings.HasPrefix(full, e.root+string(filepath.Separator)) {
+	if key == "" {
+		return e.root, nil // An empty listing prefix selects the root itself.
+	}
+	name := filepath.FromSlash(key)
+	if !filepath.IsLocal(name) {
 		return "", fmt.Errorf("invalid key %q", key)
 	}
-	return full, nil
+	return filepath.Join(e.root, name), nil
 }
 
 // List calls fn for every file below prefix.
