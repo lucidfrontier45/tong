@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alecthomas/kong"
+
 	"github.com/lucidfrontier45/tong/internal/filter"
 	"github.com/lucidfrontier45/tong/internal/syncengine"
 )
@@ -32,14 +34,144 @@ func TestRunRejectsUnsupportedOptions(t *testing.T) {
 		{"-z", "src", "dst"},
 		{"-c", "src", "dst"},
 		{"-P", "src", "dst"},
-		{"--stats", "src", "dst"},
-		{"--bwlimit", "100", "src", "dst"},
-		{"--remove-source-files", "src", "dst"},
 	} {
 		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 		code := Run(context.Background(), args, stdout, stderr)
 		if code != syncengine.CodeUsage {
 			t.Errorf("Run(%v) = %d, want %d", args, code, syncengine.CodeUsage)
+		}
+	}
+}
+
+func TestRunRejectsAnInvalidParallelism(t *testing.T) {
+	t.Parallel()
+
+	for _, parallel := range []string{"0", "-1", "many"} {
+		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+		code := Run(context.Background(), []string{"--parallel", parallel, "src", "dst"}, stdout, stderr)
+		if code != syncengine.CodeUsage {
+			t.Errorf("Run(--parallel %s) = %d, want %d", parallel, code, syncengine.CodeUsage)
+		}
+	}
+}
+
+func TestRunRefusesSourceRemovalOnUnverifiedS3Endpoint(t *testing.T) {
+	for _, setup := range []struct {
+		name string
+		env  string
+	}{
+		{name: "flag"},
+		{name: "global environment", env: "AWS_ENDPOINT_URL"},
+		{name: "service environment", env: "AWS_ENDPOINT_URL_S3"},
+	} {
+		t.Run(setup.name, func(t *testing.T) {
+			const endpoint = "http://127.0.0.1:1"
+			args := []string{"--s3-region", "us-east-1", "--remove-source-files", "-r"}
+			if setup.env == "" {
+				args = append(args, "--s3-endpoint", endpoint)
+			} else {
+				t.Setenv("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+				t.Setenv(setup.env, endpoint)
+			}
+			args = append(args, "s3://bucket/", t.TempDir()+"/")
+			stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+			if code := Run(t.Context(), args, stdout, stderr); code != syncengine.CodeUsage ||
+				!strings.Contains(stderr.String(), "requires --s3-trust-conditional-delete") {
+				t.Fatalf("Run() = %d, stderr = %q; want preflight refusal", code, stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunDefaultsToFourTransfersAtATime(t *testing.T) {
+	t.Parallel()
+
+	var opts options
+	parser, err := kong.New(&opts)
+	if err != nil {
+		t.Fatalf("kong.New() = %v", err)
+	}
+	if _, err := parser.Parse([]string{"src", "dst"}); err != nil {
+		t.Fatalf("Parse() = %v", err)
+	}
+	if opts.Parallel != 4 {
+		t.Errorf("--parallel defaults to %d, want 4", opts.Parallel)
+	}
+}
+
+func TestRunAppliesTheNewOptions(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	dst := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatalf("cannot write the source: %v", err)
+	}
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(context.Background(), []string{
+		"-a", "--parallel", "2", "--bwlimit", "1M", "--stats", "--remove-source-files",
+		src + "/", dst,
+	}, stdout, stderr)
+	if code != syncengine.CodeOK {
+		t.Fatalf("Run() = %d, want %d (%s)", code, syncengine.CodeOK, stderr)
+	}
+
+	if got := stdout.String(); !strings.Contains(got, "files_transferred=1\n") {
+		t.Errorf("the summary is %q, want it to count the transfer", got)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "a.txt")); err != nil {
+		t.Errorf("a.txt was not copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(src, "a.txt")); err == nil {
+		t.Error("the source file was not removed")
+	}
+}
+
+func TestParseRate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		value string
+		want  int64
+	}{
+		{value: "", want: 0},
+		{value: "0", want: 0},
+		// A bare number is KiB per second.
+		{value: "100", want: 100 * 1024},
+		{value: "1.5", want: 1536},
+		// A single letter or the "iB" form scales by 1024.
+		{value: "1K", want: 1 << 10},
+		{value: "1k", want: 1 << 10},
+		{value: "1KiB", want: 1 << 10},
+		{value: "1kib", want: 1 << 10},
+		{value: "1.5K", want: 1536},
+		{value: "2M", want: 2 << 20},
+		{value: "1G", want: 1 << 30},
+		{value: "1T", want: 1 << 40},
+		// A two-letter form ending in B scales by 1000.
+		{value: "1KB", want: 1000},
+		{value: "1MB", want: 1000 * 1000},
+		// A rate is exact, so it may be smaller than one KiB.
+		{value: "1B", want: 1},
+		{value: "0.5", want: 512},
+	}
+	for _, tc := range tests {
+		got, err := parseRate(tc.value)
+		if err != nil {
+			t.Errorf("parseRate(%q) = %v", tc.value, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseRate(%q) = %d, want %d", tc.value, got, tc.want)
+		}
+	}
+
+	// A rate that is asked for but rounds away would mean "no limit", and a
+	// malformed or overflowing rate is refused.
+	for _, value := range []string{"big", "-1", "1E", "1x", "1.5.5", "0.0001", "9223372036854775807"} {
+		if _, err := parseRate(value); err == nil {
+			t.Errorf("parseRate(%q) = nil, want an error", value)
 		}
 	}
 }

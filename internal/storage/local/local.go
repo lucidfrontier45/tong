@@ -44,20 +44,30 @@ func (d *Driver) ResolveSource(_ context.Context, loc storage.Location) (storage
 			return storage.Resolved{}, fmt.Errorf("%s: not a directory", loc.Path)
 		}
 		dir, file := filepath.Split(loc.Path)
+		endpoint, err := newEndpoint(dir)
+		if err != nil {
+			return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+		}
 		return storage.Resolved{
-			Endpoint: &endpoint{root: filepath.Clean(dir)},
+			Endpoint: endpoint,
 			FileKey:  file,
 			Display:  loc.Path,
 		}, nil
 	}
 
-	root := filepath.Clean(loc.Path)
+	endpoint, err := newEndpoint(loc.Path)
+	if err != nil {
+		return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+	}
 	name := ""
 	if !loc.Trailing {
-		name = filepath.Base(root)
+		name = filepath.Base(filepath.Clean(loc.Path))
+		if hasParentComponent(loc.Path) {
+			name = filepath.Base(endpoint.root)
+		}
 	}
 	return storage.Resolved{
-		Endpoint: &endpoint{root: root},
+		Endpoint: endpoint,
 		Name:     name,
 		IsDir:    true,
 		Display:  loc.Path,
@@ -69,38 +79,80 @@ func (d *Driver) ResolveDest(_ context.Context, loc storage.Location, singleFile
 	info, err := os.Stat(loc.Path)
 	switch {
 	case err == nil && info.IsDir():
-		return storage.Resolved{
-			Endpoint: &endpoint{root: filepath.Clean(loc.Path)},
-			IsDir:    true,
-			Display:  loc.Path,
-		}, nil
+		return dirDest(loc)
 	case err == nil:
 		// The destination already exists as a file. Only a single source
 		// file may be copied onto it.
-		return fileDest(loc), nil
+		return fileDest(loc)
 	case errors.Is(err, fs.ErrNotExist):
 		if singleFile {
 			// The destination holds the file that is copied.
-			return fileDest(loc), nil
+			return fileDest(loc)
 		}
-		return storage.Resolved{
-			Endpoint: &endpoint{root: filepath.Clean(loc.Path)},
-			IsDir:    true,
-			Display:  loc.Path,
-		}, nil
+		return dirDest(loc)
 	default:
 		return storage.Resolved{}, fmt.Errorf("cannot read %s: %w", loc.Path, err)
 	}
 }
 
-// fileDest resolves a destination that holds a single file.
-func fileDest(loc storage.Location) storage.Resolved {
-	dir, file := filepath.Split(loc.Path)
+// dirDest resolves a destination that is a directory.
+func dirDest(loc storage.Location) (storage.Resolved, error) {
+	endpoint, err := newEndpoint(loc.Path)
+	if err != nil {
+		return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+	}
 	return storage.Resolved{
-		Endpoint: &endpoint{root: filepath.Clean(dir)},
+		Endpoint: endpoint,
+		IsDir:    true,
+		Display:  loc.Path,
+	}, nil
+}
+
+// fileDest resolves a destination that holds a single file.
+func fileDest(loc storage.Location) (storage.Resolved, error) {
+	dir, file := filepath.Split(loc.Path)
+	endpoint, err := newEndpoint(dir)
+	if err != nil {
+		return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+	}
+	return storage.Resolved{
+		Endpoint: endpoint,
 		Name:     file,
 		Display:  loc.Path,
+	}, nil
+}
+
+// newEndpoint returns an endpoint rooted at a directory.
+//
+// The root is held as an absolute path, so that a relative location resolves
+// the same way from any working directory and so that two endpoints can be
+// compared by path.
+func newEndpoint(dir string) (*endpoint, error) {
+	if dir == "" {
+		dir = "."
 	}
+	// WalkDir does not descend into a symlink at its starting path. Resolve
+	// the selected root before cleaning "..", but leave links encountered
+	// inside the tree alone. A destination root need not exist yet.
+	resolved, err := resolveParent(dir)
+	if err != nil {
+		return nil, err
+	}
+	root, err := filepath.Abs(resolved)
+	if err != nil {
+		return nil, err
+	}
+	return &endpoint{root: root}, nil
+}
+
+// hasParentComponent reports whether cleaning could bypass a symlink.
+func hasParentComponent(name string) bool {
+	for part := range strings.SplitSeq(filepath.ToSlash(name), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // endpoint is a rooted view of a local directory.
@@ -110,11 +162,14 @@ type endpoint struct {
 
 // resolve maps a key to a path inside the endpoint root.
 func (e *endpoint) resolve(key string) (string, error) {
-	full := filepath.Join(e.root, filepath.FromSlash(key))
-	if full != e.root && !strings.HasPrefix(full, e.root+string(filepath.Separator)) {
+	if key == "" {
+		return e.root, nil // An empty listing prefix selects the root itself.
+	}
+	name := filepath.FromSlash(key)
+	if !filepath.IsLocal(name) {
 		return "", fmt.Errorf("invalid key %q", key)
 	}
-	return full, nil
+	return filepath.Join(e.root, name), nil
 }
 
 // List calls fn for every file below prefix.
@@ -158,10 +213,15 @@ func (e *endpoint) List(ctx context.Context, prefix string, fn func(storage.File
 		if !strings.HasPrefix(key, prefix) {
 			return nil
 		}
+		version, err := fileVersion(p, info)
+		if err != nil {
+			return err
+		}
 		return fn(storage.FileInfo{
 			Key:     key,
 			Size:    info.Size(),
 			ModTime: info.ModTime(),
+			Version: version,
 		})
 	})
 }
@@ -196,10 +256,15 @@ func (e *endpoint) ListShallow(ctx context.Context, prefix string, fn func(stora
 			continue
 		}
 		key := path.Join(prefix, entry.Name())
+		version, err := fileVersion(filepath.Join(dir, entry.Name()), info)
+		if err != nil {
+			return err
+		}
 		if err := fn(storage.FileInfo{
 			Key:     key,
 			Size:    info.Size(),
 			ModTime: info.ModTime(),
+			Version: version,
 		}); err != nil {
 			return err
 		}
@@ -231,7 +296,7 @@ func (e *endpoint) Open(_ context.Context, key string) (io.ReadCloser, error) {
 // The data is written to a temporary file next to the destination and moved
 // into place afterwards, the way rsync does it. A transfer that fails halfway
 // therefore leaves the previous copy of the file alone.
-func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io.Reader) error {
+func (e *endpoint) Create(ctx context.Context, key string, modTime time.Time, r io.Reader) error {
 	full, err := e.resolve(key)
 	if err != nil {
 		return err
@@ -251,7 +316,7 @@ func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(file, r); err != nil {
+	if _, err := io.Copy(file, &contextReader{ctx: ctx, r: r}); err != nil {
 		_ = file.Close()
 		return err
 	}
@@ -291,4 +356,220 @@ func (e *endpoint) Delete(_ context.Context, key string) error {
 		return err
 	}
 	return nil
+}
+
+// Identity returns a token that is equal for every path that reaches the
+// same file, so that a file reached through a link or under a different
+// spelling of its name — Report and report on a case-insensitive
+// filesystem, for example — compares equal as well.
+func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
+	full, err := e.resolve(key)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return "", err
+	}
+	return fileIdentity(full, info)
+}
+
+// EntryIdentity resolves parent directories, but keeps the final name
+// because Create replaces that entry instead of following a final symlink.
+func (e *endpoint) EntryIdentity(_ context.Context, key string) (string, error) {
+	full, err := e.resolve(key)
+	if err != nil {
+		return "", err
+	}
+	parent, err := resolveParent(filepath.Dir(full))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(full)), nil
+}
+
+// CheckMoveDestinations rejects moves that would need an entry to be both
+// a file and a directory.
+func (e *endpoint) CheckMoveDestinations(ctx context.Context, keys []string) error {
+	entries := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entry, err := e.EntryIdentity(ctx, key)
+		if err != nil {
+			return err
+		}
+		// Replacing a link to a directory could invalidate another item's
+		// path, even when that item's canonical path is outside this tree.
+		if info, err := os.Stat(entry); err == nil {
+			if info.IsDir() {
+				return fmt.Errorf("%s is already a directory or a link to one", entry)
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		entries[entry] = struct{}{}
+	}
+	for entry := range entries {
+		for child := entry; ; {
+			parent := filepath.Dir(child)
+			if parent == child {
+				break
+			}
+			if _, exists := entries[parent]; exists {
+				return fmt.Errorf("%s is both a destination file and a parent of %s", parent, entry)
+			}
+			child = parent
+		}
+	}
+	return nil
+}
+
+// CheckMoveResults checks actual filesystem identities, including for names
+// that did not exist during planning. Filesystems may alias names by case,
+// Unicode normalization, or platform-specific short names.
+func (e *endpoint) CheckMoveResults(ctx context.Context, keys []string) error {
+	seen := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		id, err := e.Identity(ctx, key)
+		if err != nil {
+			return err
+		}
+		if prev, ok := seen[id]; ok {
+			return fmt.Errorf("destination entries %q and %q identify the same file", prev, key)
+		}
+		seen[id] = key
+	}
+	return nil
+}
+
+// resolveParent resolves the longest existing prefix before appending any
+// directories that Create will make.
+func resolveParent(dir string) (string, error) {
+	real, err := filepath.EvalSymlinks(dir)
+	if err == nil {
+		return real, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	// Split without cleaning: an unresolved parent can still contain
+	// symlinks followed by "..". Trim trailing separators so that Lstat
+	// detects a dangling link rather than looking for a directory.
+	for len(dir) > 0 && os.IsPathSeparator(dir[len(dir)-1]) {
+		dir = dir[:len(dir)-1]
+	}
+	parent, name := filepath.Split(dir)
+	if name == "" || name == ".." {
+		return "", err
+	}
+	// A dangling symlink is not a directory that Create can make.
+	if _, statErr := os.Lstat(dir); statErr == nil {
+		return "", err
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return "", statErr
+	}
+	if parent == "" {
+		parent = "."
+	}
+	real, err = resolveParent(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(real, name), nil
+}
+
+// DeleteIfUnchanged removes the file stored under key when it still matches
+// the information that was listed.
+//
+// Stage first, then verify the staged entry. Never unlink a public pathname
+// on the strength of an earlier stat of that pathname.
+func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
+	full, err := e.resolve(key)
+	if err != nil {
+		return err
+	}
+	if info.Version == "" {
+		return fmt.Errorf("%w: no listed version for %s", storage.ErrChanged, key)
+	}
+	// Leave an already changed entry (especially a directory) at its public
+	// name. This early check is not sufficient to authorize deletion: the
+	// staged entry is checked independently below.
+	current, err := os.Lstat(full)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+	}
+	version, err := fileVersion(full, current)
+	if err != nil {
+		return err
+	}
+	if version != info.Version {
+		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp(filepath.Dir(full), ".tong-remove-")
+	if err != nil {
+		return err
+	}
+	// Rmdir only: a staged replacement must survive any recovery failure.
+	defer func() { _ = os.Remove(dir) }()
+	staged := filepath.Join(dir, "source")
+	if err := os.Rename(full, staged); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	moved, err := os.Lstat(staged)
+	if err == nil && moved.Mode().IsRegular() {
+		var version string
+		version, err = fileVersion(staged, moved)
+		if err == nil && version == info.Version {
+			return os.Remove(staged)
+		}
+	}
+	return errors.Join(err, restoreChanged(staged, full))
+}
+
+// restoreChanged publishes the staged file only if its name is still free.
+func restoreChanged(staged, full string) error {
+	if err := os.Link(staged, full); err != nil {
+		return fmt.Errorf("%w: cannot restore %s; recover from %s: %w", storage.ErrChanged, full, staged, err)
+	}
+	return errors.Join(fmt.Errorf("%w: %s", storage.ErrChanged, full), os.Remove(staged))
+}
+
+func fileVersion(name string, info fs.FileInfo) (string, error) {
+	id, err := fileIdentity(name, info)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s:%d:%d", id, info.Size(), info.ModTime().UnixNano()), nil
+}
+
+// contextReader stops a copy when ctx is done, so that a cancelled run does
+// not keep writing a file it will not finish.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+// Read reads from the underlying reader unless the context is done.
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }

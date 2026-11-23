@@ -32,6 +32,9 @@ var (
 	ErrUnsupportedScheme = errors.New("unsupported storage scheme")
 	// ErrNotFound is returned when a location does not exist.
 	ErrNotFound = errors.New("location not found")
+	// ErrChanged is returned by [ConditionalDeleter] when a file no longer
+	// matches the information the caller listed.
+	ErrChanged = errors.New("file changed since it was listed")
 )
 
 // FileInfo describes a single file or object.
@@ -45,6 +48,11 @@ type FileInfo struct {
 	ModTime time.Time
 	// Checksum is an optional provider checksum, such as an ETag.
 	Checksum string
+	// Version is an opaque token that identifies the revision of the file
+	// that was listed, such as its size and modification time or its ETag.
+	// The engine uses it to notice a file that changed after it was
+	// listed.
+	Version string
 }
 
 // Endpoint is a rooted view of a storage location.
@@ -86,6 +94,20 @@ type ShallowLister interface {
 	ListShallow(ctx context.Context, prefix string, fn func(FileInfo) error) error
 }
 
+// SizedCreator is an optional capability: the backend learns how large the
+// file it is asked to write is.
+//
+// A backend that splits an upload into parts uses the size to decide whether
+// the file fits into a single request and how large the parts have to be,
+// instead of buffering the stream to find out.
+type SizedCreator interface {
+	// CreateSized is [Endpoint.Create] with the size of the file in bytes.
+	// The size comes from the listing of the source, so a file that changed
+	// in between still transfers the bytes it holds, but the backend may
+	// rely on the size and report a mismatch as an error.
+	CreateSized(ctx context.Context, key string, modTime time.Time, size int64, r io.Reader) error
+}
+
 // ModTimeAware is an optional capability: the backend reports the
 // modification time of the files it lists, and lets the caller say whether
 // those times are needed.
@@ -97,6 +119,57 @@ type ModTimeAware interface {
 	// UseModTime tells the endpoint whether the modification times of the
 	// listed files matter.
 	UseModTime(enabled bool)
+}
+
+// Identifier is an optional capability: the backend can report a stable
+// identity for a key, so that the engine can tell whether a source and a
+// destination refer to the same file.
+//
+// Two keys that resolve to the same file return the same value. A local
+// backend returns the identity that the operating system assigns to the
+// file, which also catches a file that is reached through a symlink, a
+// relative component, or a different spelling of its name on a
+// case-insensitive filesystem; an object store returns the bucket and the
+// key.
+type Identifier interface {
+	// Identity returns the identity of the file stored under key.
+	Identity(ctx context.Context, key string) (string, error)
+}
+
+// EntryIdentifier identifies the entry that Create replaces and Delete
+// removes. Unlike [Identifier], it does not follow a link at the final name.
+type EntryIdentifier interface {
+	// EntryIdentity returns the identity of the entry, even if not yet created.
+	EntryIdentity(ctx context.Context, key string) (string, error)
+}
+
+// MoveDestinationChecker rejects conflicts among destination files before a move.
+type MoveDestinationChecker interface {
+	// CheckMoveDestinations checks the planned destination keys.
+	CheckMoveDestinations(ctx context.Context, keys []string) error
+}
+
+// MoveResultChecker validates the identities of completed destinations and
+// prune candidates before the engine removes any source or destination.
+type MoveResultChecker interface {
+	CheckMoveResults(ctx context.Context, keys []string) error
+}
+
+// SourceRemovalChecker rejects source removal when the endpoint cannot do it safely.
+type SourceRemovalChecker interface {
+	// CheckSourceRemoval checks whether the endpoint permits source removal.
+	CheckSourceRemoval() error
+}
+
+// ConditionalDeleter is an optional capability: the backend deletes a key
+// only while it still matches the information the caller listed, so that a
+// file that was replaced in between is not deleted.
+//
+// A delete that finds the file changed returns [ErrChanged] and leaves the
+// file in place.
+type ConditionalDeleter interface {
+	// DeleteIfUnchanged deletes key if it still matches info.
+	DeleteIfUnchanged(ctx context.Context, key string, info FileInfo) error
 }
 
 // Location is a parsed command-line location.

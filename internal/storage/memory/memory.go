@@ -12,6 +12,7 @@ import (
 	"maps"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,9 @@ import (
 type Driver struct {
 	mu    sync.Mutex
 	files map[string]blob
+	// generation changes with every write, so that two writes of the same
+	// length and modification time still produce different versions.
+	generation uint64
 }
 
 // blob is a file held in memory.
@@ -78,9 +82,15 @@ func (d *Driver) Put(root, key string, data []byte, modTime time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	d.generation++
 	full := fullKey(namespace(root), key)
 	d.files[full] = blob{
-		info: storage.FileInfo{Key: key, Size: int64(len(data)), ModTime: modTime},
+		info: storage.FileInfo{
+			Key:     key,
+			Size:    int64(len(data)),
+			ModTime: modTime,
+			Version: versionOf(int64(len(data)), modTime, d.generation),
+		},
 		data: data,
 	}
 }
@@ -138,26 +148,29 @@ func (e *endpoint) List(ctx context.Context, prefix string, fn func(storage.File
 	maps.Copy(files, e.driver.files)
 	e.driver.mu.Unlock()
 
-	var keys []string
-	for key := range files {
-		rel, ok := relative(e.root, key)
-		if !ok {
-			continue
+	// The files are sorted by their full key, which keeps the relative
+	// keys of a namespace in order too.
+	fulls := make([]string, 0, len(files))
+	for full := range files {
+		if _, ok := relative(e.root, full); ok {
+			fulls = append(fulls, full)
 		}
-		keys = append(keys, rel)
 	}
-	sort.Strings(keys)
+	sort.Strings(fulls)
 
-	for _, key := range keys {
+	for _, full := range fulls {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rel := key
-		if !strings.HasPrefix(rel, prefix) {
+		key, ok := relative(e.root, full)
+		if !ok || !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		info := files[key].info
-		info.Key = rel
+		// The information of the file is looked up by its full key, so
+		// that the size and the modification time are not lost below the
+		// root namespace.
+		info := files[full].info
+		info.Key = key
 		if err := fn(info); err != nil {
 			return err
 		}
@@ -200,8 +213,14 @@ func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io
 	e.driver.mu.Lock()
 	defer e.driver.mu.Unlock()
 
+	e.driver.generation++
 	e.driver.files[fullKey(e.root, key)] = blob{
-		info: storage.FileInfo{Key: key, Size: int64(len(data)), ModTime: modTime},
+		info: storage.FileInfo{
+			Key:     key,
+			Size:    int64(len(data)),
+			ModTime: modTime,
+			Version: versionOf(int64(len(data)), modTime, e.driver.generation),
+		},
 		data: data,
 	}
 	return nil
@@ -214,6 +233,36 @@ func (e *endpoint) Delete(_ context.Context, key string) error {
 
 	delete(e.driver.files, fullKey(e.root, key))
 	return nil
+}
+
+// Identity returns the namespace and the key of the file.
+func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
+	return "memory://" + fullKey(e.root, key), nil
+}
+
+// DeleteIfUnchanged removes a file when it still matches the information that
+// was listed.
+//
+// The comparison and the deletion happen under one lock, so that a write
+// that lands between them cannot be removed by mistake.
+func (e *endpoint) DeleteIfUnchanged(_ context.Context, key string, info storage.FileInfo) error {
+	e.driver.mu.Lock()
+	defer e.driver.mu.Unlock()
+
+	full := fullKey(e.root, key)
+	if b, ok := e.driver.files[full]; ok && info.Version != "" && b.info.Version != info.Version {
+		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+	}
+	delete(e.driver.files, full)
+	return nil
+}
+
+// versionOf returns a token that changes when the contents or the
+// modification time of a file change, or when the file is written again.
+func versionOf(size int64, modTime time.Time, generation uint64) string {
+	return strconv.FormatInt(size, 10) + ":" +
+		strconv.FormatInt(modTime.UnixNano(), 10) + ":" +
+		strconv.FormatUint(generation, 10)
 }
 
 // namespace turns a location path into a namespace.
