@@ -40,6 +40,16 @@ const mtimeMetadata = "mtime"
 // size the object tops out at 160 GiB, which is 10,000 parts of this size.
 const defaultPartSize = 16 << 20
 
+// defaultUploadConcurrency is the number of parts that are uploaded at the
+// same time.
+//
+// It is deliberately independent of --parallel. The SDK allocates
+// Concurrency+1 part buffers per multipart object, so a part concurrency that
+// followed the number of files in flight would multiply the memory twice:
+// at 16 MiB buffered parts and 16 files in flight, four parts cost 1.3 GiB
+// while a part concurrency of eight would cost 2.3 GiB.
+const defaultUploadConcurrency = 4
+
 // Options configure the S3 driver.
 type Options struct {
 	// Region overrides the region of the AWS configuration.
@@ -53,7 +63,9 @@ type Options struct {
 	// use it to exercise multipart uploads with small objects.
 	PartSize int64
 	// UploadConcurrency is the number of parts that are uploaded at the
-	// same time. Zero means the default of the SDK.
+	// same time. Zero means [defaultUploadConcurrency]. It is not exposed
+	// on the command line, so that the memory of an upload does not grow
+	// with the number of files in flight.
 	UploadConcurrency int
 }
 
@@ -225,12 +237,16 @@ func (d *Driver) newEndpoint(client *awss3.Client, bucket, prefix string) *endpo
 	if partSize == 0 {
 		partSize = defaultPartSize
 	}
+	concurrency := d.opts.UploadConcurrency
+	if concurrency == 0 {
+		concurrency = defaultUploadConcurrency
+	}
 	return &endpoint{
 		client:       client,
 		bucket:       bucket,
 		prefix:       prefix,
 		partSize:     partSize,
-		concurrency:  d.opts.UploadConcurrency,
+		concurrency:  concurrency,
 		fetchModTime: true,
 	}
 }

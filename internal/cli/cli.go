@@ -129,9 +129,6 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	registry.Register(storage.SchemeS3, s3.New(s3.Options{
 		Region:   opts.S3Region,
 		Endpoint: opts.S3Endpoint,
-		// A single --parallel knob drives both the files of the run and
-		// the parts of a multipart upload.
-		UploadConcurrency: opts.Parallel,
 	}))
 
 	sources := make([]storage.Resolved, 0, len(opts.Srcs)-1)
