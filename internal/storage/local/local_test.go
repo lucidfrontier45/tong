@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -306,6 +308,136 @@ func TestDriverDoesNotDeleteMetadataPreservingReplacement(t *testing.T) {
 	data, err := os.ReadFile(name) //nolint:gosec // name is inside the test's temporary directory
 	if err != nil || string(data) != "new" {
 		t.Errorf("replacement contents = %q, %v; want new file retained", data, err)
+	}
+}
+
+func TestDriverIdentifiesAFileIndependentlyOfItsSpelling(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	driver := local.New()
+	dest, err := driver.ResolveDest(t.Context(), storage.Location{
+		Scheme: storage.SchemeFile,
+		Path:   root,
+	}, false)
+	if err != nil {
+		t.Fatalf("ResolveDest() = %v", err)
+	}
+	identifier := dest.Endpoint.(storage.Identifier)
+
+	if err := os.WriteFile(filepath.Join(root, "Report"), []byte("body"), 0o600); err != nil {
+		t.Fatalf("cannot write the file: %v", err)
+	}
+	report, err := identifier.Identity(t.Context(), "Report")
+	if err != nil {
+		t.Fatalf("Identity() = %v", err)
+	}
+
+	// Two hard links are one file, so they share an identity.
+	if err := os.Link(filepath.Join(root, "Report"), filepath.Join(root, "link")); err != nil {
+		t.Fatalf("cannot create a hard link: %v", err)
+	}
+	linked, err := identifier.Identity(t.Context(), "link")
+	if err != nil {
+		t.Fatalf("Identity() = %v", err)
+	}
+	if linked != report {
+		t.Errorf("the identity of a hard link is %q, want %q", linked, report)
+	}
+
+	// A file reached under a different spelling of its name holds one
+	// identity on a filesystem that folds the spellings together.
+	if _, err := os.Lstat(filepath.Join(root, "REPORT")); err != nil {
+		t.Skipf("the filesystem distinguishes the spellings: %v", err)
+	}
+	folded, err := identifier.Identity(t.Context(), "REPORT")
+	if err != nil {
+		t.Fatalf("Identity() = %v", err)
+	}
+	if folded != report {
+		t.Errorf("the identity of the folded spelling is %q, want %q", folded, report)
+	}
+
+	// A different file does not share the identity.
+	if err := os.WriteFile(filepath.Join(root, "other"), []byte("body"), 0o600); err != nil {
+		t.Fatalf("cannot write the file: %v", err)
+	}
+	other, err := identifier.Identity(t.Context(), "other")
+	if err != nil {
+		t.Fatalf("Identity() = %v", err)
+	}
+	if other == report {
+		t.Error("two different files share an identity")
+	}
+}
+
+func TestDriverNeverDeletesAReplacementWhileChecking(t *testing.T) {
+	t.Parallel()
+
+	stamp := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	for range 200 {
+		root := t.TempDir()
+		name := filepath.Join(root, "a.txt")
+		if err := os.WriteFile(name, []byte("old"), 0o600); err != nil {
+			t.Fatalf("cannot write the file: %v", err)
+		}
+		if err := os.Chtimes(name, stamp, stamp); err != nil {
+			t.Fatalf("cannot set the time: %v", err)
+		}
+		// The replacement has the same length and time, so only the
+		// identity of the file tells it apart.
+		tmp := filepath.Join(root, ".swap")
+		if err := os.WriteFile(tmp, []byte("new"), 0o600); err != nil {
+			t.Fatalf("cannot write the replacement: %v", err)
+		}
+		if err := os.Chtimes(tmp, stamp, stamp); err != nil {
+			t.Fatalf("cannot set the time: %v", err)
+		}
+
+		driver := local.New()
+		dest, err := driver.ResolveDest(t.Context(), storage.Location{
+			Scheme: storage.SchemeFile,
+			Path:   root,
+		}, false)
+		if err != nil {
+			t.Fatalf("ResolveDest() = %v", err)
+		}
+		info := listOne(t, dest.Endpoint, "a.txt")
+
+		// A producer renames the replacement onto the checked file while
+		// the check is running, so the removal races the replacement.
+		var installed atomic.Bool
+		started := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			<-started
+			if err := os.Rename(tmp, name); err == nil {
+				installed.Store(true)
+			}
+		})
+
+		close(started)
+		err = dest.Endpoint.(storage.ConditionalDeleter).
+			DeleteIfUnchanged(t.Context(), "a.txt", info)
+		wg.Wait()
+
+		if err != nil && !errors.Is(err, storage.ErrChanged) {
+			t.Fatalf("DeleteIfUnchanged() = %v, want nil or %v", err, storage.ErrChanged)
+		}
+		if !installed.Load() {
+			// The producer did not land its replacement, so this round
+			// proves nothing.
+			continue
+		}
+		// Whatever the outcome, the replacement of the producer must still
+		// be there. A removal that deletes it loses data.
+		data, readErr := os.ReadFile(name) //nolint:gosec // the test wrote the file
+		if readErr != nil {
+			t.Fatalf("the replacement of the producer is gone: %v", readErr)
+		}
+		if string(data) != "new" {
+			t.Fatalf("the file holds %q, want the replacement to survive", data)
+		}
 	}
 }
 

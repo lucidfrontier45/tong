@@ -126,9 +126,11 @@ type ModTimeAware interface {
 // destination refer to the same file.
 //
 // Two keys that resolve to the same file return the same value. A local
-// backend returns the resolved absolute path, which also catches a file that
-// is reached through a symlink or a relative component; an object store
-// returns the bucket and the key.
+// backend returns the identity that the operating system assigns to the
+// file, which also catches a file that is reached through a symlink, a
+// relative component, or a different spelling of its name on a
+// case-insensitive filesystem; an object store returns the bucket and the
+// key.
 type Identifier interface {
 	// Identity returns the identity of the file stored under key.
 	Identity(ctx context.Context, key string) (string, error)

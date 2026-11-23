@@ -299,15 +299,22 @@ a size match alone is not enough evidence to delete the source.
 operation here that can lose data, so a move adds two guards: it compares
 mtimes even without `-t`, and it deletes a source only after confirming that
 the file still matches the listing it planned from. A source that resolves to
-the destination itself — including through a symlink — is left in place with
-exit 23, and two sources that would write one destination key are refused with
-exit 1 before anything is written or deleted.
+the destination itself — including through a symlink, or under another
+spelling of the same name on a case-insensitive filesystem — is left in place
+with exit 23, and two sources that would write one destination key are
+refused with exit 1 before anything is written or deleted.
 
 **How a move checks a source before removing it.** A local file is compared by
 size, modification time, and filesystem identity, so replacing it with a
-same-size, same-mtime file is detected. S3 removal uses an atomic conditional
-delete on the listed ETag. Source removal is disabled by default on custom
-S3 endpoints, including overrides from the AWS SDK configuration. Pass
+same-size, same-mtime file is detected. The comparison happens on an open
+handle, and the checked file is moved to a private name before it is
+unlinked, so a producer that renames a replacement onto the source during the
+check cannot lose its file; such a run keeps the source and exits 23. A local
+move still expects nothing to rewrite the source while it is being read; a
+source that changes during a transfer is detected before it is removed. S3
+removal uses an atomic conditional delete on the listed ETag. Source removal
+is disabled by default on custom S3 endpoints, including overrides from the
+AWS SDK configuration. Pass
 `--s3-trust-conditional-delete` only after verifying the endpoint enforces
 `If-Match` on `DeleteObject`. An endpoint that ignores the header, such as
 LocalStack 3.8.1, can delete a replacement object. Copies to or from these

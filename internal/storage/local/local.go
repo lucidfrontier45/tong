@@ -348,13 +348,27 @@ func (e *endpoint) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-// Identity returns the absolute path of the file, with every symlink
-// resolved, so that paths that reach the same file compare equal.
+// Identity returns a token that is equal for every path that reaches the
+// same file, so that a file reached through a link or under a different
+// spelling of its name — Report and report on a case-insensitive
+// filesystem, for example — compares equal as well.
 func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
 	full, err := e.resolve(key)
 	if err != nil {
 		return "", err
 	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return "", err
+	}
+	if device, inode, ok := fileIDOf(info); ok {
+		// The identity of the file itself, because two spellings of one
+		// name must not produce two identities on a filesystem that folds
+		// them together.
+		return strconv.FormatUint(device, 10) + ":" + strconv.FormatUint(inode, 10), nil
+	}
+	// The platform exposes no file id, so the resolved path is the closest
+	// identity there is.
 	return filepath.EvalSymlinks(full)
 }
 
@@ -448,13 +462,23 @@ func resolveParent(dir string) (string, error) {
 
 // DeleteIfUnchanged removes the file stored under key when it still matches
 // the information that was listed.
+//
+// The file is checked through an open handle and moved to a private name
+// before it is unlinked, so that the entry which is removed is the entry
+// which was checked. A replacement that a producer renames onto the key in
+// the meantime is put back, and the removal fails with [storage.ErrChanged].
 func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
 	full, err := e.resolve(key)
 	if err != nil {
 		return err
 	}
+	if info.Version == "" {
+		// There is nothing to compare against, so the file is removed
+		// without a check.
+		return e.Delete(ctx, key)
+	}
 
-	current, err := os.Stat(full)
+	file, err := os.Open(full) //nolint:gosec // resolve confines the key to the root
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// The file went away, so there is nothing left to remove.
@@ -462,25 +486,84 @@ func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info stora
 		}
 		return err
 	}
-	if info.Version != "" && versionOf(current) != info.Version {
+	defer func() { _ = file.Close() }()
+
+	// versionOf covers the size, the modification time and the identity of
+	// the file, so a replacement of the same length and time is refused.
+	current, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if versionOf(current) != info.Version {
 		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
 	}
-	return e.Delete(ctx, key)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Renaming the checked entry to a name that only this call knows keeps
+	// a concurrent producer from renaming a replacement onto the name that
+	// is about to be unlinked.
+	name, err := tempName(filepath.Dir(full))
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(full, name); err != nil {
+		return err
+	}
+
+	moved, err := os.Stat(name)
+	if err != nil {
+		return fmt.Errorf("cannot verify the staged removal of %s: %w", name, err)
+	}
+	if os.SameFile(moved, current) {
+		// The entry at the private name is the file that was checked, so
+		// removing it cannot delete a replacement.
+		return os.Remove(name)
+	}
+	// The key was replaced while the entry was staged. Put the replacement
+	// back, unless yet another entry took its place, and keep the source
+	// either way.
+	if _, statErr := os.Lstat(full); errors.Is(statErr, fs.ErrNotExist) {
+		if err := os.Rename(name, full); err != nil {
+			return fmt.Errorf("cannot move %s back to %s: %w", name, full, err)
+		}
+	} else if statErr != nil {
+		return fmt.Errorf("cannot check %s: %w", full, statErr)
+	}
+	return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+}
+
+// fileIDOf returns the numbers the operating system uses to tell files
+// apart, and reports false when the platform does not expose them.
+func fileIDOf(info fs.FileInfo) (uint64, uint64, bool) {
+	sys := reflect.ValueOf(info.Sys())
+	if !sys.IsValid() || sys.Kind() != reflect.Pointer || sys.IsNil() {
+		return 0, 0, false
+	}
+	sys = sys.Elem()
+	device, inode := sys.FieldByName("Dev"), sys.FieldByName("Ino")
+	if device.IsValid() && inode.IsValid() && device.CanUint() && inode.CanUint() {
+		return device.Uint(), inode.Uint(), true
+	}
+	// Windows exposes a volume serial number and a file index instead,
+	// which is what os.SameFile compares there.
+	volume, idxhi, idxlo := sys.FieldByName("vol"), sys.FieldByName("idxhi"), sys.FieldByName("idxlo")
+	if volume.IsValid() && idxhi.IsValid() && idxlo.IsValid() &&
+		volume.CanUint() && idxhi.CanUint() && idxlo.CanUint() {
+		return volume.Uint(), idxhi.Uint()<<32 | idxlo.Uint(), true
+	}
+	return 0, 0, false
 }
 
 // versionOf returns a token that changes when the contents or the
 // modification time of a file change. It is the check that rsync applies
 // before it removes a source, with the sub-second resolution that the
-// filesystem offers.
+// filesystem offers and the identity of the file.
 func versionOf(info fs.FileInfo) string {
 	version := strconv.FormatInt(info.Size(), 10) + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
-	sys := reflect.ValueOf(info.Sys())
-	if sys.IsValid() && sys.Kind() == reflect.Pointer && !sys.IsNil() {
-		sys = sys.Elem()
-		device, inode := sys.FieldByName("Dev"), sys.FieldByName("Ino")
-		if device.IsValid() && inode.IsValid() && device.CanUint() && inode.CanUint() {
-			return version + ":" + strconv.FormatUint(device.Uint(), 10) + ":" + strconv.FormatUint(inode.Uint(), 10)
-		}
+	if device, inode, ok := fileIDOf(info); ok {
+		return version + ":" + strconv.FormatUint(device, 10) + ":" + strconv.FormatUint(inode, 10)
 	}
 	return version
 }

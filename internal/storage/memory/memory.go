@@ -25,6 +25,9 @@ import (
 type Driver struct {
 	mu    sync.Mutex
 	files map[string]blob
+	// generation changes with every write, so that two writes of the same
+	// length and modification time still produce different versions.
+	generation uint64
 }
 
 // blob is a file held in memory.
@@ -79,13 +82,14 @@ func (d *Driver) Put(root, key string, data []byte, modTime time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	d.generation++
 	full := fullKey(namespace(root), key)
 	d.files[full] = blob{
 		info: storage.FileInfo{
 			Key:     key,
 			Size:    int64(len(data)),
 			ModTime: modTime,
-			Version: versionOf(int64(len(data)), modTime),
+			Version: versionOf(int64(len(data)), modTime, d.generation),
 		},
 		data: data,
 	}
@@ -209,12 +213,13 @@ func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io
 	e.driver.mu.Lock()
 	defer e.driver.mu.Unlock()
 
+	e.driver.generation++
 	e.driver.files[fullKey(e.root, key)] = blob{
 		info: storage.FileInfo{
 			Key:     key,
 			Size:    int64(len(data)),
 			ModTime: modTime,
-			Version: versionOf(int64(len(data)), modTime),
+			Version: versionOf(int64(len(data)), modTime, e.driver.generation),
 		},
 		data: data,
 	}
@@ -237,23 +242,27 @@ func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
 
 // DeleteIfUnchanged removes a file when it still matches the information that
 // was listed.
-func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
+//
+// The comparison and the deletion happen under one lock, so that a write
+// that lands between them cannot be removed by mistake.
+func (e *endpoint) DeleteIfUnchanged(_ context.Context, key string, info storage.FileInfo) error {
 	e.driver.mu.Lock()
-	full := fullKey(e.root, key)
-	b, ok := e.driver.files[full]
-	e.driver.mu.Unlock()
+	defer e.driver.mu.Unlock()
 
-	if ok && info.Version != "" && b.info.Version != info.Version {
+	full := fullKey(e.root, key)
+	if b, ok := e.driver.files[full]; ok && info.Version != "" && b.info.Version != info.Version {
 		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
 	}
-	return e.Delete(ctx, key)
+	delete(e.driver.files, full)
+	return nil
 }
 
 // versionOf returns a token that changes when the contents or the
-// modification time of a file change.
-func versionOf(size int64, modTime time.Time) string {
+// modification time of a file change, or when the file is written again.
+func versionOf(size int64, modTime time.Time, generation uint64) string {
 	return strconv.FormatInt(size, 10) + ":" +
-		strconv.FormatInt(modTime.UnixNano(), 10)
+		strconv.FormatInt(modTime.UnixNano(), 10) + ":" +
+		strconv.FormatUint(generation, 10)
 }
 
 // namespace turns a location path into a namespace.

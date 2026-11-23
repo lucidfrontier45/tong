@@ -1112,6 +1112,71 @@ func TestRunRefusesToRemoveTheDestination(t *testing.T) {
 	}
 }
 
+func TestRunRefusesMovingOntoAHardLinkOfTheSource(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	source := filepath.Join(dir, "a")
+	writeFile(t, source, "hello")
+	if err := os.Link(source, filepath.Join(dir, "b")); err != nil {
+		t.Skipf("cannot create a hard link: %v", err)
+	}
+
+	stderr := &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{resolveSource(t, source)},
+		resolveDestFile(t, filepath.Join(dir, "b"), true),
+		Options{RemoveSourceFiles: true},
+		io.Discard, stderr,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, stderr %q; want %d", code, stderr.String(), CodePartial)
+	}
+	if got := readFile(t, source); got != "hello" {
+		t.Errorf("the source holds %q, want it to be kept", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "b")); got != "hello" {
+		t.Errorf("the link holds %q, want it to be kept", got)
+	}
+	if !strings.Contains(stderr.String(), "skipping remove of destination file") {
+		t.Errorf("the diagnostics are %q, want the refusal", stderr)
+	}
+}
+
+func TestRunRefusesMovingAFileUnderAFoldedSpelling(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	name := filepath.Join(dir, "Report")
+	writeFile(t, name, "hello")
+
+	// The move only folds on a case-insensitive filesystem, where the
+	// spelled destination names the file that is moved.
+	if _, err := os.Lstat(filepath.Join(dir, "report")); err != nil {
+		t.Skipf("the filesystem distinguishes the spellings: %v", err)
+	}
+
+	stderr := &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{resolveSource(t, name)},
+		resolveDestFile(t, filepath.Join(dir, "report"), true),
+		Options{RemoveSourceFiles: true},
+		io.Discard, stderr,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, stderr %q; want %d", code, stderr.String(), CodePartial)
+	}
+	// The file must stay reachable under both spellings.
+	for _, spelling := range []string{"Report", "report"} {
+		if _, err := os.Stat(filepath.Join(dir, spelling)); err != nil {
+			t.Errorf("%s is no longer accessible: %v", spelling, err)
+		}
+	}
+	if got := readFile(t, name); got != "hello" {
+		t.Errorf("the file holds %q, want hello", got)
+	}
+}
+
 func TestRunRefusesToRemoveADirectoryIntoItself(t *testing.T) {
 	t.Parallel()
 
