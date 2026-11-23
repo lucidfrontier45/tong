@@ -157,6 +157,7 @@ argument is a source. Sources and destinations are URLs:
 | `--stats`           | Print a transfer summary as `key=value` lines          |
 | `--remove-source-files` | Delete source files that are in sync with the destination (one-way move) |
 | `--s3-endpoint URL` | Use a custom S3-compatible endpoint                    |
+| `--s3-trust-conditional-delete` | Allow removing sources on a custom endpoint verified to enforce `If-Match` |
 | `--s3-region REGION`| Override the AWS region                                |
 | `-h, --help`        | Show help                                              |
 
@@ -305,15 +306,18 @@ exit 1 before anything is written or deleted.
 **How a move checks a source before removing it.** A local file is compared by
 size, modification time, and filesystem identity, so replacing it with a
 same-size, same-mtime file is detected. S3 removal uses an atomic conditional
-delete on the listed ETag. Use `--remove-source-files` with S3-compatible
-endpoints only if they enforce `If-Match` on `DeleteObject`; an endpoint that
-ignores the header can delete a replacement object. LocalStack 3.8.1 is one
-such endpoint. When the check detects a changed source, tong keeps it and
-exits 23. Moves also reject two writes to the
-same destination entry (including through directory symlinks) and overlapping
-source/destination mappings before writing or deleting anything. Destination
-pruning keeps the entries targeted by a transfer, even through directory
-symlinks.
+delete on the listed ETag. Source removal is disabled by default on custom
+S3 endpoints, including overrides from the AWS SDK configuration. Pass
+`--s3-trust-conditional-delete` only after verifying the endpoint enforces
+`If-Match` on `DeleteObject`. An endpoint that ignores the header, such as
+LocalStack 3.8.1, can delete a replacement object. Copies to or from these
+endpoints do not require the flag. When the check detects a changed source,
+tong keeps it and exits 23.
+
+Before writing or deleting anything, moves reject multiple writes to the
+same destination entry, conflicting local file/directory destinations, and
+overlapping source/destination mappings. Destination pruning keeps the
+entries targeted by a transfer, even through directory symlinks.
 
 **Why part concurrency is not `--parallel`.** The SDK allocates
 `Concurrency+1` part buffers per object, so tying part concurrency to the

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -137,8 +139,18 @@ func TestIntegration(t *testing.T) {
 	}
 
 	t.Run("ConditionalDelete", func(t *testing.T) {
+		if os.Getenv("TONG_TEST_S3_CONDITIONAL_DELETE") != "1" {
+			t.Skip("set TONG_TEST_S3_CONDITIONAL_DELETE=1 to test If-Match support")
+		}
 		ctx := t.Context()
-		deleter, ok := dest.Endpoint.(storage.ConditionalDeleter)
+		driver := s3.New(s3.Options{Region: region, Endpoint: endpoint, TrustConditionalDelete: true})
+		trusted, err := driver.ResolveDest(ctx, storage.Location{
+			Scheme: storage.SchemeS3, Bucket: bucket, Key: prefix,
+		}, false)
+		if err != nil {
+			t.Fatalf("resolve trusted endpoint: %v", err)
+		}
+		deleter, ok := trusted.Endpoint.(storage.ConditionalDeleter)
 		if !ok {
 			t.Fatal("S3 endpoint does not support conditional removal")
 		}
@@ -149,7 +161,7 @@ func TestIntegration(t *testing.T) {
 		if err := dest.Endpoint.Create(ctx, "a.txt", modTime, strings.NewReader(replacement)); err != nil {
 			t.Fatalf("replace object: %v", err)
 		}
-		err := deleter.DeleteIfUnchanged(ctx, "a.txt", listed)
+		err = deleter.DeleteIfUnchanged(ctx, "a.txt", listed)
 		if apiErr, ok := errors.AsType[interface {
 			error
 			ErrorCode() string
@@ -176,6 +188,41 @@ func TestIntegration(t *testing.T) {
 	}
 	if _, err := source.Endpoint.Open(ctx, "a.txt"); !errors.Is(err, storage.ErrNotFound) {
 		t.Errorf("Open() = %v, want %v", err, storage.ErrNotFound)
+	}
+}
+
+func TestDeleteIfUnchangedRequiresTrustForCustomEndpoint(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	const etag = `"listed-etag"`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/bucket/file" {
+			t.Errorf("request = %s %s, want DELETE /bucket/file", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("If-Match"); got != etag {
+			t.Errorf("If-Match = %q, want %q", got, etag)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	for _, trust := range []bool{false, true} {
+		driver := s3.New(s3.Options{Region: "us-east-1", Endpoint: server.URL, TrustConditionalDelete: trust})
+		source, err := driver.ResolveSource(t.Context(), storage.Location{Scheme: storage.SchemeS3, Bucket: "bucket"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		deleter, ok := source.Endpoint.(storage.ConditionalDeleter)
+		if !ok {
+			t.Fatal("S3 endpoint does not support conditional removal")
+		}
+		err = deleter.DeleteIfUnchanged(t.Context(), "file", storage.FileInfo{Version: etag})
+		if trust && err != nil {
+			t.Errorf("trusted conditional delete: %v", err)
+		} else if !trust && (err == nil || !strings.Contains(err.Error(), "requires --s3-trust-conditional-delete")) {
+			t.Errorf("untrusted conditional delete = %v, want refusal", err)
+		}
 	}
 }
 

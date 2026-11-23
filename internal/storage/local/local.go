@@ -57,14 +57,16 @@ func (d *Driver) ResolveSource(_ context.Context, loc storage.Location) (storage
 		}, nil
 	}
 
-	root := filepath.Clean(loc.Path)
-	name := ""
-	if !loc.Trailing {
-		name = filepath.Base(root)
-	}
-	endpoint, err := newEndpoint(root)
+	endpoint, err := newEndpoint(loc.Path)
 	if err != nil {
 		return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+	}
+	name := ""
+	if !loc.Trailing {
+		name = filepath.Base(filepath.Clean(loc.Path))
+		if hasParentComponent(loc.Path) {
+			name = filepath.Base(endpoint.root)
+		}
 	}
 	return storage.Resolved{
 		Endpoint: endpoint,
@@ -128,11 +130,30 @@ func fileDest(loc storage.Location) (storage.Resolved, error) {
 // the same way from any working directory and so that two endpoints can be
 // compared by path.
 func newEndpoint(dir string) (*endpoint, error) {
-	root, err := filepath.Abs(filepath.Clean(dir))
+	// Cleaning a path with ".." before resolving symlinks can select a
+	// different directory than the OS did when it statted the input.
+	if hasParentComponent(dir) {
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return nil, err
+		}
+		dir = resolved
+	}
+	root, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
 	}
 	return &endpoint{root: root}, nil
+}
+
+// hasParentComponent reports whether cleaning could bypass a symlink.
+func hasParentComponent(name string) bool {
+	for part := range strings.SplitSeq(filepath.ToSlash(name), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // endpoint is a rooted view of a local directory.
@@ -349,6 +370,44 @@ func (e *endpoint) EntryIdentity(_ context.Context, key string) (string, error) 
 		return "", err
 	}
 	return filepath.Join(parent, filepath.Base(full)), nil
+}
+
+// CheckMoveDestinations rejects moves that would need an entry to be both
+// a file and a directory.
+func (e *endpoint) CheckMoveDestinations(ctx context.Context, keys []string) error {
+	entries := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entry, err := e.EntryIdentity(ctx, key)
+		if err != nil {
+			return err
+		}
+		// Replacing a link to a directory could invalidate another item's
+		// path, even when that item's canonical path is outside this tree.
+		if info, err := os.Stat(entry); err == nil {
+			if info.IsDir() {
+				return fmt.Errorf("%s is already a directory or a link to one", entry)
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		entries[entry] = struct{}{}
+	}
+	for entry := range entries {
+		for child := entry; ; {
+			parent := filepath.Dir(child)
+			if parent == child {
+				break
+			}
+			if _, exists := entries[parent]; exists {
+				return fmt.Errorf("%s is both a destination file and a parent of %s", parent, entry)
+			}
+			child = parent
+		}
+	}
+	return nil
 }
 
 // resolveParent resolves the longest existing prefix before appending any

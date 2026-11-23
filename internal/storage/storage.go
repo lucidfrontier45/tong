@@ -141,6 +141,18 @@ type EntryIdentifier interface {
 	EntryIdentity(ctx context.Context, key string) (string, error)
 }
 
+// MoveDestinationChecker rejects conflicts among destination files before a move.
+type MoveDestinationChecker interface {
+	// CheckMoveDestinations checks the planned destination keys.
+	CheckMoveDestinations(ctx context.Context, keys []string) error
+}
+
+// SourceRemovalChecker rejects source removal when the endpoint cannot do it safely.
+type SourceRemovalChecker interface {
+	// CheckSourceRemoval checks whether the endpoint permits source removal.
+	CheckSourceRemoval() error
+}
+
 // ConditionalDeleter is an optional capability: the backend deletes a key
 // only while it still matches the information the caller listed, so that a
 // file that was replaced in between is not deleted.

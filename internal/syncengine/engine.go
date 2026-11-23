@@ -197,6 +197,17 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 		return CodeSelect
 	}
 
+	if opts.RemoveSourceFiles {
+		for _, src := range sources {
+			if checker, ok := src.Endpoint.(storage.SourceRemovalChecker); ok {
+				if err := checker.CheckSourceRemoval(); err != nil {
+					_, _ = fmt.Fprintf(stderr, "tong: %s: %v\n", src.Display, err)
+					return CodeUsage
+				}
+			}
+		}
+	}
+
 	// The modification times of the destination only matter when they are
 	// compared or preserved.
 	useModTime(dest.Endpoint, opts.comparesTimes())
@@ -236,6 +247,9 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 	}
 	if opts.RemoveSourceFiles {
 		if err := p.checkOverlappingMove(ctx); err != nil {
+			if ctx.Err() != nil {
+				return CodeSignal
+			}
 			_, _ = fmt.Fprintf(stderr, "tong: refusing overlapping move: %v\n", err)
 			return CodeUsage
 		}
@@ -255,6 +269,19 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 // checkOverlappingMove rejects a move that would overwrite a source planned
 // for removal through another source-to-destination mapping.
 func (p *plan) checkOverlappingMove(ctx context.Context) error {
+	if validator, ok := p.dest.Endpoint.(storage.MoveDestinationChecker); ok {
+		keys := make([]string, 0, len(p.items)+len(p.removals))
+		for _, it := range p.items {
+			keys = append(keys, it.destKey)
+		}
+		for _, r := range p.removals {
+			keys = append(keys, r.destKey)
+		}
+		if err := validator.CheckMoveDestinations(ctx, keys); err != nil {
+			return err
+		}
+	}
+
 	destinations, ok := p.dest.Endpoint.(storage.Identifier)
 	if !ok {
 		return nil

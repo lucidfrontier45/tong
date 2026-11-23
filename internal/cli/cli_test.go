@@ -55,6 +55,34 @@ func TestRunRejectsAnInvalidParallelism(t *testing.T) {
 	}
 }
 
+func TestRunRefusesSourceRemovalOnUnverifiedS3Endpoint(t *testing.T) {
+	for _, setup := range []struct {
+		name string
+		env  string
+	}{
+		{name: "flag"},
+		{name: "global environment", env: "AWS_ENDPOINT_URL"},
+		{name: "service environment", env: "AWS_ENDPOINT_URL_S3"},
+	} {
+		t.Run(setup.name, func(t *testing.T) {
+			const endpoint = "http://127.0.0.1:1"
+			args := []string{"--s3-region", "us-east-1", "--remove-source-files", "-r"}
+			if setup.env == "" {
+				args = append(args, "--s3-endpoint", endpoint)
+			} else {
+				t.Setenv("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+				t.Setenv(setup.env, endpoint)
+			}
+			args = append(args, "s3://bucket/", t.TempDir()+"/")
+			stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+			if code := Run(t.Context(), args, stdout, stderr); code != syncengine.CodeUsage ||
+				!strings.Contains(stderr.String(), "requires --s3-trust-conditional-delete") {
+				t.Fatalf("Run() = %d, stderr = %q; want preflight refusal", code, stderr.String())
+			}
+		})
+	}
+}
+
 func TestRunDefaultsToFourTransfersAtATime(t *testing.T) {
 	t.Parallel()
 

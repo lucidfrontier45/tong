@@ -21,31 +21,32 @@ import (
 
 // options is the command line grammar of tong.
 type options struct {
-	Recursive      bool     `kong:"short='r',help='Recurse into directories'"`
-	Archive        bool     `kong:"short='a',help='Archive mode: -r -t'"`
-	Verbose        int      `kong:"short='v',type='counter',help='Increase verbosity (repeatable)'"`
-	DryRun         bool     `kong:"short='n',name='dry-run',help='Show what would be transferred without changing anything'"`
-	Delete         bool     `kong:"help='Delete extraneous files from the destination'"`
-	Times          bool     `kong:"short='t',help='Preserve modification times'"`
-	Compress       bool     `kong:"short='z',help='Compress file data during transfer'"`
-	Checksum       bool     `kong:"short='c',help='Skip based on checksums, not size + mtime'"`
-	SizeOnly       bool     `kong:"name='size-only',help='Skip based on size only'"`
-	Update         bool     `kong:"short='u',help='Skip files that are newer on the destination'"`
-	Existing       bool     `kong:"help='Skip creating new files on the destination'"`
-	IgnoreExisting bool     `kong:"name='ignore-existing',help='Skip files that already exist on the destination'"`
-	Include        []string `kong:"help='Do not exclude files matching PATTERN',sep='none',placeholder='PATTERN'"`
-	Exclude        []string `kong:"help='Exclude files matching PATTERN',sep='none',placeholder='PATTERN'"`
-	ExcludeFrom    []string `kong:"name='exclude-from',help='Read exclude patterns from FILE',sep='none',placeholder='FILE'"`
-	MaxSize        string   `kong:"name='max-size',help='Do not transfer files larger than SIZE',placeholder='SIZE'"`
-	MinSize        string   `kong:"name='min-size',help='Do not transfer files smaller than SIZE',placeholder='SIZE'"`
-	BWLimit        string   `kong:"name='bwlimit',help='Limit I/O bandwidth, KiB/s',placeholder='KBPS'"`
-	Partial        bool     `kong:"short='P',help='Same as --partial --progress'"`
-	Stats          bool     `kong:"help='Print a transfer summary as key=value lines'"`
-	RemoveSource   bool     `kong:"name='remove-source-files',help='Delete source files that are in sync with the destination'"`
-	Parallel       int      `kong:"name='parallel',default='4',help='Transfer this many files at the same time',placeholder='N'"`
-	S3Endpoint     string   `kong:"name='s3-endpoint',help='Use a custom S3-compatible endpoint'"`
-	S3Region       string   `kong:"name='s3-region',help='Override the AWS region'"`
-	Srcs           []string `kong:"arg='true',name='src',optional='true',help='Source and destination paths'"`
+	Recursive                bool     `kong:"short='r',help='Recurse into directories'"`
+	Archive                  bool     `kong:"short='a',help='Archive mode: -r -t'"`
+	Verbose                  int      `kong:"short='v',type='counter',help='Increase verbosity (repeatable)'"`
+	DryRun                   bool     `kong:"short='n',name='dry-run',help='Show what would be transferred without changing anything'"`
+	Delete                   bool     `kong:"help='Delete extraneous files from the destination'"`
+	Times                    bool     `kong:"short='t',help='Preserve modification times'"`
+	Compress                 bool     `kong:"short='z',help='Compress file data during transfer'"`
+	Checksum                 bool     `kong:"short='c',help='Skip based on checksums, not size + mtime'"`
+	SizeOnly                 bool     `kong:"name='size-only',help='Skip based on size only'"`
+	Update                   bool     `kong:"short='u',help='Skip files that are newer on the destination'"`
+	Existing                 bool     `kong:"help='Skip creating new files on the destination'"`
+	IgnoreExisting           bool     `kong:"name='ignore-existing',help='Skip files that already exist on the destination'"`
+	Include                  []string `kong:"help='Do not exclude files matching PATTERN',sep='none',placeholder='PATTERN'"`
+	Exclude                  []string `kong:"help='Exclude files matching PATTERN',sep='none',placeholder='PATTERN'"`
+	ExcludeFrom              []string `kong:"name='exclude-from',help='Read exclude patterns from FILE',sep='none',placeholder='FILE'"`
+	MaxSize                  string   `kong:"name='max-size',help='Do not transfer files larger than SIZE',placeholder='SIZE'"`
+	MinSize                  string   `kong:"name='min-size',help='Do not transfer files smaller than SIZE',placeholder='SIZE'"`
+	BWLimit                  string   `kong:"name='bwlimit',help='Limit I/O bandwidth, KiB/s',placeholder='KBPS'"`
+	Partial                  bool     `kong:"short='P',help='Same as --partial --progress'"`
+	Stats                    bool     `kong:"help='Print a transfer summary as key=value lines'"`
+	RemoveSource             bool     `kong:"name='remove-source-files',help='Delete source files that are in sync with the destination'"`
+	Parallel                 int      `kong:"name='parallel',default='4',help='Transfer this many files at the same time',placeholder='N'"`
+	S3Endpoint               string   `kong:"name='s3-endpoint',help='Use a custom S3-compatible endpoint'"`
+	S3TrustConditionalDelete bool     `kong:"name='s3-trust-conditional-delete',help='Allow source removal on a custom S3 endpoint verified to enforce If-Match'"`
+	S3Region                 string   `kong:"name='s3-region',help='Override the AWS region'"`
+	Srcs                     []string `kong:"arg='true',name='src',optional='true',help='Source and destination paths'"`
 }
 
 // Run parses the command line, runs the sync and returns the exit code of
@@ -127,8 +128,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	registry := storage.NewRegistry()
 	registry.Register(storage.SchemeFile, local.New())
 	registry.Register(storage.SchemeS3, s3.New(s3.Options{
-		Region:   opts.S3Region,
-		Endpoint: opts.S3Endpoint,
+		Region:                 opts.S3Region,
+		Endpoint:               opts.S3Endpoint,
+		TrustConditionalDelete: opts.S3TrustConditionalDelete,
 	}))
 
 	sources := make([]storage.Resolved, 0, len(opts.Srcs)-1)

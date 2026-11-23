@@ -1320,6 +1320,77 @@ func TestRunCopyReplacesDestinationLeafSymlink(t *testing.T) {
 	}
 }
 
+func TestRunMovesFromParentOfSymlinkTarget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	first, second := filepath.Join(dir, "first"), filepath.Join(dir, "second")
+	other, source := filepath.Join(first, "file"), filepath.Join(second, "file")
+	writeFile(t, other, "unrelated")
+	writeFile(t, source, "intended")
+	if err := os.Mkdir(filepath.Join(second, "child"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(first, "link")
+	if err := os.Symlink(filepath.Join(second, "child"), link); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+	// Preserve the raw ".." instead of cleaning it with filepath.Join.
+	raw := link + "/../file"
+	dest := filepath.Join(dir, "dst")
+	code := Run(t.Context(), []storage.Resolved{resolveSource(t, raw)}, resolveDest(t, dest+"/"),
+		Options{RemoveSourceFiles: true}, io.Discard, io.Discard)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+	if got := readFile(t, filepath.Join(dest, "file")); got != "intended" {
+		t.Errorf("copied %q, want intended", got)
+	}
+	if got := readFile(t, other); got != "unrelated" {
+		t.Errorf("unrelated file changed to %q", got)
+	}
+	if _, err := os.Stat(source); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("intended source should have been moved: %v", err)
+	}
+}
+
+func TestRunRefusesMovingFileOverDestinationAncestor(t *testing.T) {
+	t.Parallel()
+
+	for _, symlink := range []bool{false, true} {
+		dir := t.TempDir()
+		tree := filepath.Join(dir, "tree", "b")
+		nested, flat := filepath.Join(tree, "file"), filepath.Join(dir, "flat", "b")
+		writeFile(t, nested, "nested")
+		writeFile(t, flat, "flat")
+		dest := filepath.Join(dir, "dest")
+		if symlink {
+			if err := os.Mkdir(dest, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(dir, "target")
+			if err := os.Mkdir(target, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(dest, "b")); err != nil {
+				t.Skipf("cannot create symlink: %v", err)
+			}
+		}
+
+		code := Run(t.Context(), []storage.Resolved{resolveSource(t, tree), resolveSource(t, flat)}, resolveDest(t, dest+"/"),
+			Options{Recursive: true, Parallel: 1, RemoveSourceFiles: true}, io.Discard, io.Discard)
+		if code != CodeUsage {
+			t.Fatalf("Run(symlink=%v) = %d, want %d", symlink, code, CodeUsage)
+		}
+		if readFile(t, nested) != "nested" || readFile(t, flat) != "flat" {
+			t.Error("conflicting move modified the sources")
+		}
+		if _, err := os.Stat(filepath.Join(dest, "b", "file")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("destination should remain unchanged: %v", err)
+		}
+	}
+}
+
 func TestRunLetsTheFirstSourceWinACopyCollision(t *testing.T) {
 	t.Parallel()
 

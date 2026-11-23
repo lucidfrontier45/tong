@@ -58,6 +58,9 @@ type Options struct {
 	// uses path-style addressing, which is what most compatible services
 	// expect.
 	Endpoint string
+	// TrustConditionalDelete permits source removal on a custom endpoint
+	// the operator has verified enforces If-Match on DeleteObject.
+	TrustConditionalDelete bool
 	// PartSize overrides the size of a multipart part. Zero means
 	// [defaultPartSize]. It is not exposed on the command line; the tests
 	// use it to exercise multipart uploads with small objects.
@@ -242,12 +245,13 @@ func (d *Driver) newEndpoint(client *awss3.Client, bucket, prefix string) *endpo
 		concurrency = defaultUploadConcurrency
 	}
 	return &endpoint{
-		client:       client,
-		bucket:       bucket,
-		prefix:       prefix,
-		partSize:     partSize,
-		concurrency:  concurrency,
-		fetchModTime: true,
+		client:             client,
+		bucket:             bucket,
+		prefix:             prefix,
+		partSize:           partSize,
+		concurrency:        concurrency,
+		fetchModTime:       true,
+		allowSourceRemoval: d.opts.TrustConditionalDelete || client.Options().BaseEndpoint == nil,
 	}
 }
 
@@ -265,6 +269,8 @@ type endpoint struct {
 	// fetchModTime tells whether the listing looks up the modification
 	// time of every object it finds.
 	fetchModTime bool
+	// allowSourceRemoval excludes unverified endpoint overrides.
+	allowSourceRemoval bool
 
 	mu sync.Mutex
 	// mp is the transfer manager that uploads objects in parts, created on
@@ -498,6 +504,9 @@ func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
 // The delete is conditional on the ETag observed during listing. S3-compatible
 // endpoints must enforce If-Match for this to protect a replacement object.
 func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
+	if err := e.CheckSourceRemoval(); err != nil {
+		return err
+	}
 	if info.Version == "" {
 		return fmt.Errorf("%w: s3://%s/%s has no ETag", storage.ErrChanged, e.bucket, e.key(key))
 	}
@@ -511,6 +520,14 @@ func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info stora
 			return fmt.Errorf("%w: s3://%s/%s", storage.ErrChanged, e.bucket, e.key(key))
 		}
 		return fmt.Errorf("cannot conditionally delete s3://%s/%s: %w", e.bucket, e.key(key), err)
+	}
+	return nil
+}
+
+// CheckSourceRemoval rejects custom endpoints unless explicitly trusted.
+func (e *endpoint) CheckSourceRemoval() error {
+	if !e.allowSourceRemoval {
+		return errors.New("source removal on a custom S3 endpoint requires --s3-trust-conditional-delete")
 	}
 	return nil
 }
