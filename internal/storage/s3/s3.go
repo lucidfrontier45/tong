@@ -349,6 +349,7 @@ func (e *endpoint) info(ctx context.Context, objectKey, key string, object awss3
 		Size:     aws.ToInt64(object.Size),
 		ModTime:  aws.ToTime(object.LastModified),
 		Checksum: aws.ToString(object.ETag),
+		Version:  aws.ToString(object.ETag),
 	}
 
 	if !e.fetchModTime {
@@ -484,6 +485,40 @@ func (e *endpoint) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("cannot delete s3://%s/%s: %w", e.bucket, e.key(key), err)
 	}
 	return nil
+}
+
+// Identity returns the bucket and the key of the object.
+func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
+	return "s3://" + e.bucket + "/" + e.key(key), nil
+}
+
+// DeleteIfUnchanged removes an object when its ETag still matches the one
+// that was listed.
+//
+// The comparison is a request of its own rather than a conditional delete, so
+// that it works against the S3-compatible services that do not implement the
+// conditional headers yet. The window between the two requests is the same
+// one that rsync has when it re-checks a source before removing it.
+func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
+	if info.Version == "" {
+		return e.Delete(ctx, key)
+	}
+
+	out, err := e.client.HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket: aws.String(e.bucket),
+		Key:    aws.String(e.key(key)),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			// The object went away, so there is nothing left to remove.
+			return nil
+		}
+		return fmt.Errorf("cannot stat s3://%s/%s: %w", e.bucket, e.key(key), err)
+	}
+	if aws.ToString(out.ETag) != info.Version {
+		return fmt.Errorf("%w: s3://%s/%s", storage.ErrChanged, e.bucket, e.key(key))
+	}
+	return e.Delete(ctx, key)
 }
 
 // isNotFound reports whether an error means that the object is gone.

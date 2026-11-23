@@ -12,6 +12,7 @@ import (
 	"maps"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,7 +81,12 @@ func (d *Driver) Put(root, key string, data []byte, modTime time.Time) {
 
 	full := fullKey(namespace(root), key)
 	d.files[full] = blob{
-		info: storage.FileInfo{Key: key, Size: int64(len(data)), ModTime: modTime},
+		info: storage.FileInfo{
+			Key:     key,
+			Size:    int64(len(data)),
+			ModTime: modTime,
+			Version: versionOf(int64(len(data)), modTime),
+		},
 		data: data,
 	}
 }
@@ -204,7 +210,12 @@ func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io
 	defer e.driver.mu.Unlock()
 
 	e.driver.files[fullKey(e.root, key)] = blob{
-		info: storage.FileInfo{Key: key, Size: int64(len(data)), ModTime: modTime},
+		info: storage.FileInfo{
+			Key:     key,
+			Size:    int64(len(data)),
+			ModTime: modTime,
+			Version: versionOf(int64(len(data)), modTime),
+		},
 		data: data,
 	}
 	return nil
@@ -217,6 +228,32 @@ func (e *endpoint) Delete(_ context.Context, key string) error {
 
 	delete(e.driver.files, fullKey(e.root, key))
 	return nil
+}
+
+// Identity returns the namespace and the key of the file.
+func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
+	return "memory://" + fullKey(e.root, key), nil
+}
+
+// DeleteIfUnchanged removes a file when it still matches the information that
+// was listed.
+func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
+	e.driver.mu.Lock()
+	full := fullKey(e.root, key)
+	b, ok := e.driver.files[full]
+	e.driver.mu.Unlock()
+
+	if ok && info.Version != "" && b.info.Version != info.Version {
+		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+	}
+	return e.Delete(ctx, key)
+}
+
+// versionOf returns a token that changes when the contents or the
+// modification time of a file change.
+func versionOf(size int64, modTime time.Time) string {
+	return strconv.FormatInt(size, 10) + ":" +
+		strconv.FormatInt(modTime.UnixNano(), 10)
 }
 
 // namespace turns a location path into a namespace.

@@ -1086,3 +1086,250 @@ func (e *vanishingEndpoint) Delete(_ context.Context, key string) error {
 	delete(e.files, key)
 	return nil
 }
+
+func TestRunRefusesToRemoveTheDestination(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	name := filepath.Join(dir, "a.txt")
+	writeFile(t, name, "hello")
+
+	stderr := &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{resolveSource(t, name)},
+		resolveDestFile(t, name, true),
+		Options{RemoveSourceFiles: true},
+		io.Discard, stderr,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, want %d", code, CodePartial)
+	}
+	if got := readFile(t, name); got != "hello" {
+		t.Errorf("the destination holds %q, want %q", got, "hello")
+	}
+	if !strings.Contains(stderr.String(), "skipping remove of destination file") {
+		t.Errorf("the diagnostics are %q, want the refusal", stderr)
+	}
+}
+
+func TestRunRefusesToRemoveADirectoryIntoItself(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	name := filepath.Join(dir, "a.txt")
+	writeFile(t, name, "hello")
+
+	code := Run(t.Context(),
+		[]storage.Resolved{resolveSource(t, dir+"/")},
+		resolveDest(t, dir),
+		Options{Recursive: true, RemoveSourceFiles: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, want %d", code, CodePartial)
+	}
+	if got := readFile(t, name); got != "hello" {
+		t.Errorf("the file holds %q, want it to be kept", got)
+	}
+}
+
+func TestRunRefusesToRemoveThroughASymlink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	name := filepath.Join(dir, "data", "a.txt")
+	writeFile(t, name, "hello")
+	if err := os.Symlink(filepath.Join(dir, "data"), filepath.Join(dir, "link")); err != nil {
+		t.Skipf("cannot create a symlink: %v", err)
+	}
+
+	code := Run(t.Context(),
+		[]storage.Resolved{resolveSource(t, filepath.Join(dir, "data")+"/")},
+		resolveDest(t, filepath.Join(dir, "link")+"/"),
+		Options{Recursive: true, RemoveSourceFiles: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, want %d", code, CodePartial)
+	}
+	if got := readFile(t, name); got != "hello" {
+		t.Errorf("the file holds %q, want it to be kept", got)
+	}
+}
+
+func TestRunRefusesToMoveWhenTwoSourcesWriteOneKey(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a", "x"), "AAAA")
+	writeFile(t, filepath.Join(dir, "b", "x"), "BBBBBBBB")
+	dest := filepath.Join(dir, "dst")
+
+	code := Run(t.Context(),
+		[]storage.Resolved{
+			resolveSource(t, filepath.Join(dir, "a")+"/"),
+			resolveSource(t, filepath.Join(dir, "b")+"/"),
+		},
+		resolveDest(t, dest),
+		Options{Recursive: true, RemoveSourceFiles: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeUsage {
+		t.Fatalf("Run() = %d, want %d", code, CodeUsage)
+	}
+	if got := readFile(t, filepath.Join(dir, "a", "x")); got != "AAAA" {
+		t.Errorf("a/x = %q, want it to be kept", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "b", "x")); got != "BBBBBBBB" {
+		t.Errorf("b/x = %q, want it to be kept", got)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "x")); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("the destination was written, want nothing to happen")
+	}
+}
+
+func TestRunLetsTheFirstSourceWinACopyCollision(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a", "x"), "AAAA")
+	writeFile(t, filepath.Join(dir, "b", "x"), "BBBBBBBB")
+	dest := filepath.Join(dir, "dst")
+
+	code := Run(t.Context(),
+		[]storage.Resolved{
+			resolveSource(t, filepath.Join(dir, "a")+"/"),
+			resolveSource(t, filepath.Join(dir, "b")+"/"),
+		},
+		resolveDest(t, dest),
+		Options{Recursive: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+	if got := readFile(t, filepath.Join(dest, "x")); got != "AAAA" {
+		t.Errorf("dst/x = %q, want the first source to win", got)
+	}
+}
+
+func TestRunComparesModificationTimesInAMove(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte("aaa"), time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+	driver.Put("dst", "a.txt", []byte("bbb"), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		memoryDest(t, driver, "dst"),
+		Options{Recursive: true, RemoveSourceFiles: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+	if got, _ := driver.Get("dst", "a.txt"); string(got) != "aaa" {
+		t.Errorf("dst holds %q, want the source to replace it", got)
+	}
+	if keys := driver.Keys("src"); len(keys) != 0 {
+		t.Errorf("the source holds %v, want it to be removed", keys)
+	}
+}
+
+func TestRunKeepsTheCopyOnlySizeShortcut(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte("aaa"), time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+	driver.Put("dst", "a.txt", []byte("bbb"), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		memoryDest(t, driver, "dst"),
+		Options{Recursive: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+	if got, _ := driver.Get("dst", "a.txt"); string(got) != "bbb" {
+		t.Errorf("dst holds %q, want the size-only shortcut to keep it", got)
+	}
+}
+
+func TestRunKeepsAChangedSource(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte("hello"), time.Now())
+
+	src := memorySource(t, driver, "src/")
+	src.Endpoint = &changingEndpoint{Endpoint: src.Endpoint}
+
+	stderr := &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{src},
+		memoryDest(t, driver, "dst"),
+		Options{Recursive: true, RemoveSourceFiles: true},
+		io.Discard, stderr,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, want %d", code, CodePartial)
+	}
+	if keys := driver.Keys("src"); len(keys) != 1 {
+		t.Errorf("the source holds %v, want it to be kept", keys)
+	}
+	if !strings.Contains(stderr.String(), "file changed since it was listed") {
+		t.Errorf("the diagnostics are %q, want the change to be reported", stderr)
+	}
+}
+
+func TestRunStopsRemovingWhenCancelled(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte("changed"), time.Now())
+	driver.Put("src", "b.txt", []byte("same"), time.Now())
+	driver.Put("dst", "b.txt", []byte("same"), time.Now())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	dest := memoryDest(t, driver, "dst")
+	dest.Endpoint = &cancellingEndpoint{Endpoint: dest.Endpoint, cancel: cancel}
+
+	code := Run(ctx,
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		dest,
+		Options{Recursive: true, RemoveSourceFiles: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeSignal {
+		t.Fatalf("Run() = %d, want %d", code, CodeSignal)
+	}
+	if keys := driver.Keys("src"); len(keys) != 2 {
+		t.Errorf("the source holds %v, want no file to be removed after a cancel", keys)
+	}
+}
+
+// changingEndpoint is a source whose files change after they were listed.
+type changingEndpoint struct {
+	storage.Endpoint
+}
+
+// DeleteIfUnchanged reports that the file changed.
+func (e *changingEndpoint) DeleteIfUnchanged(_ context.Context, key string, _ storage.FileInfo) error {
+	return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+}
+
+// cancellingEndpoint is a destination that cancels the run on the first
+// write.
+type cancellingEndpoint struct {
+	storage.Endpoint
+	cancel context.CancelFunc
+}
+
+// Create cancels the run and then writes the file.
+func (e *cancellingEndpoint) Create(ctx context.Context, key string, modTime time.Time, r io.Reader) error {
+	e.cancel()
+	return e.Endpoint.Create(ctx, key, modTime, r)
+}

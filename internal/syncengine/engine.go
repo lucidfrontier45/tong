@@ -30,6 +30,8 @@ const (
 	CodeUsage = 1
 	// CodeSelect means that a source or destination could not be selected.
 	CodeSelect = 3
+	// CodeSignal means that the run stopped because it was interrupted.
+	CodeSignal = 20
 	// CodePartial means that some files could not be transferred.
 	CodePartial = 23
 	// CodeVanished means that some source files disappeared before they
@@ -78,6 +80,16 @@ type Options struct {
 	RemoveSourceFiles bool
 }
 
+// comparesTimes reports whether the quick check compares modification times.
+//
+// rsync always compares size and mtime. tong compares only the size by
+// default, because an mtime on object storage costs a request per object;
+// it compares the time whenever the run already pays for it, and always in a
+// move, where a size match alone is not enough to delete the source.
+func (o Options) comparesTimes() bool {
+	return o.Times || o.Update || o.RemoveSourceFiles
+}
+
 // decision is what comparing a source file with its destination decides.
 type decision int
 
@@ -111,6 +123,15 @@ type plan struct {
 	destFiles map[string]storage.FileInfo
 	// planned holds the destination keys that the sources provide.
 	planned map[string]bool
+	// owners maps a destination key to the source file that provides it, so
+	// that two sources that write one key are noticed.
+	owners map[string]string
+	// collisions holds the destination keys that more than one source
+	// provides, which makes a move ambiguous.
+	collisions []collision
+	// refused holds the source files that were not removed because they are
+	// the destination itself.
+	refused []string
 	// items holds the files that have to be transferred.
 	items []item
 	// removals holds the source files that are already in sync and that
@@ -125,11 +146,19 @@ type plan struct {
 	printMu sync.Mutex
 }
 
+// collision is a destination key that two sources write.
+type collision struct {
+	dest   string
+	first  string
+	second string
+}
+
 // removal is a source file that is already in sync with the destination.
 type removal struct {
 	src     storage.Endpoint
 	key     string
 	display string
+	info    storage.FileInfo
 }
 
 // stats counts what a run did. The counters are updated from the workers,
@@ -169,7 +198,7 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 
 	// The modification times of the destination only matter when they are
 	// compared or preserved.
-	useModTime(dest.Endpoint, opts.Times || opts.Update)
+	useModTime(dest.Endpoint, opts.comparesTimes())
 
 	destFiles, err := listDest(ctx, dest)
 	if err != nil {
@@ -183,6 +212,7 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 		dest:      dest,
 		destFiles: destFiles,
 		planned:   make(map[string]bool),
+		owners:    make(map[string]string),
 		limiter:   ratelimit.New(opts.BWLimit, nil),
 	}
 
@@ -191,6 +221,18 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 			_, _ = fmt.Fprintf(stderr, "tong: cannot read %s: %v\n", src.Display, err)
 			return CodePartial
 		}
+	}
+
+	// A move cannot resolve two sources that write one destination key: only
+	// one of the payloads survives, so one of the sources would be deleted
+	// without its contents having reached the destination. Refuse before
+	// anything is written or removed.
+	if len(p.collisions) > 0 {
+		for _, c := range p.collisions {
+			_, _ = fmt.Fprintf(stderr, "tong: %s: written by both %s and %s\n", p.destPath(c.dest), c.first, c.second)
+		}
+		_, _ = fmt.Fprintln(stderr, "tong: refusing to remove source files when two sources write one destination")
+		return CodeUsage
 	}
 
 	return p.execute(ctx, stdout, stderr)
@@ -208,21 +250,21 @@ func useModTime(endpoint storage.Endpoint, enabled bool) {
 func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
 	// The modification times of the source only matter when they are
 	// compared or preserved.
-	useModTime(src.Endpoint, p.opts.Times || p.opts.Update)
+	useModTime(src.Endpoint, p.opts.comparesTimes())
 
 	if !src.IsDir {
 		info, err := lookup(ctx, src.Endpoint, src.FileKey)
 		if err != nil {
 			return err
 		}
-		p.consider(src, src.FileKey, info)
+		p.consider(ctx, src, src.FileKey, info)
 		return nil
 	}
 
 	if !p.opts.Recursive {
 		if shallow, ok := src.Endpoint.(storage.ShallowLister); ok {
 			return shallow.ListShallow(ctx, "", func(info storage.FileInfo) error {
-				p.consider(src, info.Key, info)
+				p.consider(ctx, src, info.Key, info)
 				return nil
 			})
 		}
@@ -232,19 +274,19 @@ func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
 			if strings.Contains(info.Key, "/") {
 				return nil
 			}
-			p.consider(src, info.Key, info)
+			p.consider(ctx, src, info.Key, info)
 			return nil
 		})
 	}
 
 	return src.Endpoint.List(ctx, "", func(info storage.FileInfo) error {
-		p.consider(src, info.Key, info)
+		p.consider(ctx, src, info.Key, info)
 		return nil
 	})
 }
 
 // consider decides whether a source file has to be copied.
-func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo) {
+func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, info storage.FileInfo) {
 	destKey := p.destKey(src, key)
 
 	// The filters match the path of the file in the destination, which is
@@ -262,6 +304,28 @@ func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo)
 
 	p.planned[destKey] = true
 
+	source := srcDisplay(src, key)
+	if first, ok := p.owners[destKey]; ok {
+		// A copy keeps rsync's order: the first source that provides the
+		// key wins, and a source listed twice is simply the same file.
+		if first != source && p.opts.RemoveSourceFiles {
+			p.collisions = append(p.collisions, collision{dest: destKey, first: first, second: source})
+		}
+		return
+	}
+	p.owners[destKey] = source
+
+	// A source that resolves to the destination itself is the only copy
+	// there is. Copying it onto itself would do nothing and removing it
+	// would lose the data, so a move leaves it alone.
+	if p.opts.RemoveSourceFiles && p.sameFile(ctx, src.Endpoint, key, destKey) {
+		p.stats.total.Add(1)
+		p.stats.skipped.Add(1)
+		p.stats.errors.Add(1)
+		p.refused = append(p.refused, source)
+		return
+	}
+
 	dst, exists := p.destFiles[destKey]
 	switch compare(info, dst, exists, p.opts) {
 	case decisionExcluded:
@@ -276,7 +340,8 @@ func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo)
 			p.removals = append(p.removals, removal{
 				src:     src.Endpoint,
 				key:     key,
-				display: srcDisplay(src, key),
+				display: source,
+				info:    info,
 			})
 		}
 		return
@@ -284,14 +349,36 @@ func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo)
 		p.stats.total.Add(1)
 	}
 
-	srcDisplay := srcDisplay(src, key)
 	p.items = append(p.items, item{
 		src:        src.Endpoint,
 		srcKey:     key,
-		srcDisplay: srcDisplay,
+		srcDisplay: source,
 		destKey:    destKey,
 		info:       info,
 	})
+}
+
+// sameFile reports whether the source file and the destination key it maps to
+// are the same file. It reports false when a backend cannot tell.
+func (p *plan) sameFile(ctx context.Context, src storage.Endpoint, srcKey, destKey string) bool {
+	source, ok := src.(storage.Identifier)
+	if !ok {
+		return false
+	}
+	destination, ok := p.dest.Endpoint.(storage.Identifier)
+	if !ok {
+		return false
+	}
+
+	srcID, err := source.Identity(ctx, srcKey)
+	if err != nil {
+		return false
+	}
+	destID, err := destination.Identity(ctx, destKey)
+	if err != nil {
+		return false
+	}
+	return srcID == destID
 }
 
 // srcDisplay renders the path of a source file for output.
@@ -340,6 +427,20 @@ func (p *plan) execute(ctx context.Context, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// A source that is also the destination was left alone on purpose, but
+	// the removal the caller asked for did not happen, so the run is partial.
+	for _, display := range p.refused {
+		p.print(stderr, "tong: skipping remove of destination file: %s\n", display)
+	}
+	failed += len(p.refused)
+
+	// A cancelled run touches nothing else: the caller asked it to stop, so
+	// no source is removed and no extraneous file is deleted after that.
+	if err := ctx.Err(); err != nil {
+		p.report(stdout)
+		return CodeSignal
+	}
+
 	// A file that is already in sync is removed as well, because
 	// --remove-source-files turns the transfer list into a move.
 	failed += p.removeSynced(ctx, stderr)
@@ -382,8 +483,19 @@ func (p *plan) transferAll(ctx context.Context, stdout, stderr io.Writer) []erro
 			}
 		})
 	}
+
+	// Stop handing out work as soon as the run is cancelled, so that an
+	// interrupted run does not start files it will not finish.
+dispatch:
 	for i := range p.items {
-		jobs <- i
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			for j := i; j < len(p.items); j++ {
+				errs[j] = ctx.Err()
+			}
+			break dispatch
+		}
 	}
 	close(jobs)
 	wg.Wait()
@@ -405,7 +517,12 @@ func (p *plan) transfer(ctx context.Context, it item, stdout, stderr io.Writer) 
 	p.stats.bytes.Add(bytesRead)
 
 	if p.opts.RemoveSourceFiles {
-		if err := it.src.Delete(ctx, it.srcKey); err != nil {
+		// A cancelled run removes nothing, even a file whose copy made it
+		// through, because the caller asked the whole move to stop.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := deleteSource(ctx, it.src, it.srcKey, it.info); err != nil {
 			p.stats.errors.Add(1)
 			p.print(stderr, "tong: %v\n", err)
 			return err
@@ -419,12 +536,35 @@ func (p *plan) transfer(ctx context.Context, it item, stdout, stderr io.Writer) 
 	return nil
 }
 
+// deleteSource removes a source file that is in place on the destination.
+//
+// The file is only removed while it still matches the information that was
+// listed: a source that was replaced or rewritten after the listing keeps its
+// place instead of being deleted, because the bytes that reached the
+// destination are not the bytes that the file holds now.
+func deleteSource(ctx context.Context, src storage.Endpoint, key string, info storage.FileInfo) error {
+	if deleter, ok := src.(storage.ConditionalDeleter); ok {
+		return deleter.DeleteIfUnchanged(ctx, key, info)
+	}
+
+	// The backend cannot compare and delete in one step, so compare the
+	// file that is there now with the one that was listed.
+	current, err := lookup(ctx, src, key)
+	if err != nil {
+		return err
+	}
+	if info.Version != "" && current.Version != info.Version {
+		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+	}
+	return src.Delete(ctx, key)
+}
+
 // removeSynced deletes the source files that are already in sync with the
 // destination and returns the number of removals that failed.
 func (p *plan) removeSynced(ctx context.Context, stderr io.Writer) int {
 	failed := 0
 	for _, r := range p.removals {
-		if err := r.src.Delete(ctx, r.key); err != nil {
+		if err := deleteSource(ctx, r.src, r.key, r.info); err != nil {
 			failed++
 			p.stats.errors.Add(1)
 			p.print(stderr, "tong: %v\n", err)
@@ -464,6 +604,9 @@ func (p *plan) preview(stdout io.Writer) {
 	}
 	if !p.opts.RemoveSourceFiles {
 		return
+	}
+	for _, display := range p.refused {
+		p.print(stdout, "would skip remove of destination file: %s\n", display)
 	}
 	for _, it := range p.items {
 		p.print(stdout, "would remove %s\n", it.srcDisplay)
@@ -548,7 +691,7 @@ func (p *plan) copyFile(ctx context.Context, it item) (int64, error) {
 	// reaches the source.
 	var source io.Reader = reader
 	if p.limiter != nil {
-		source = p.limiter.Reader(source)
+		source = p.limiter.Reader(ctx, source)
 	}
 	counted := &countingReader{r: source}
 
@@ -644,7 +787,7 @@ func compare(src, dst storage.FileInfo, exists bool, opts Options) decision {
 		return decisionTransfer
 	case opts.SizeOnly:
 		return decisionInSync
-	case opts.Times:
+	case opts.comparesTimes():
 		if sameTime(src.ModTime, dst.ModTime) {
 			return decisionInSync
 		}

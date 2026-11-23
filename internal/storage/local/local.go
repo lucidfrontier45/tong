@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -192,6 +193,7 @@ func (e *endpoint) List(ctx context.Context, prefix string, fn func(storage.File
 			Key:     key,
 			Size:    info.Size(),
 			ModTime: info.ModTime(),
+			Version: versionOf(info),
 		})
 	})
 }
@@ -230,6 +232,7 @@ func (e *endpoint) ListShallow(ctx context.Context, prefix string, fn func(stora
 			Key:     key,
 			Size:    info.Size(),
 			ModTime: info.ModTime(),
+			Version: versionOf(info),
 		}); err != nil {
 			return err
 		}
@@ -261,7 +264,7 @@ func (e *endpoint) Open(_ context.Context, key string) (io.ReadCloser, error) {
 // The data is written to a temporary file next to the destination and moved
 // into place afterwards, the way rsync does it. A transfer that fails halfway
 // therefore leaves the previous copy of the file alone.
-func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io.Reader) error {
+func (e *endpoint) Create(ctx context.Context, key string, modTime time.Time, r io.Reader) error {
 	full, err := e.resolve(key)
 	if err != nil {
 		return err
@@ -281,7 +284,7 @@ func (e *endpoint) Create(_ context.Context, key string, modTime time.Time, r io
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(file, r); err != nil {
+	if _, err := io.Copy(file, &contextReader{ctx: ctx, r: r}); err != nil {
 		_ = file.Close()
 		return err
 	}
@@ -321,4 +324,63 @@ func (e *endpoint) Delete(_ context.Context, key string) error {
 		return err
 	}
 	return nil
+}
+
+// Identity returns the absolute path of the file, with every symlink
+// resolved, so that paths that reach the same file compare equal.
+func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
+	full, err := e.resolve(key)
+	if err != nil {
+		return "", err
+	}
+	if real, err := filepath.EvalSymlinks(full); err == nil {
+		full = real
+	}
+	return full, nil
+}
+
+// DeleteIfUnchanged removes the file stored under key when it still matches
+// the information that was listed.
+func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
+	full, err := e.resolve(key)
+	if err != nil {
+		return err
+	}
+
+	current, err := os.Stat(full)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// The file went away, so there is nothing left to remove.
+			return nil
+		}
+		return err
+	}
+	if info.Version != "" && versionOf(current) != info.Version {
+		return fmt.Errorf("%w: %s", storage.ErrChanged, key)
+	}
+	return e.Delete(ctx, key)
+}
+
+// versionOf returns a token that changes when the contents or the
+// modification time of a file change. It is the check that rsync applies
+// before it removes a source, with the sub-second resolution that the
+// filesystem offers.
+func versionOf(info fs.FileInfo) string {
+	return strconv.FormatInt(info.Size(), 10) + ":" +
+		strconv.FormatInt(info.ModTime().UnixNano(), 10)
+}
+
+// contextReader stops a copy when ctx is done, so that a cancelled run does
+// not keep writing a file it will not finish.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+// Read reads from the underlying reader unless the context is done.
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -197,4 +198,94 @@ func TestDriverKeepsKeysInsideTheRoot(t *testing.T) {
 	if err := dest.Endpoint.Create(context.Background(), "../escape.txt", time.Time{}, bytes.NewReader(nil)); err == nil {
 		t.Error("Create() = nil, want the key to be refused")
 	}
+}
+
+func TestDriverResolvesARelativeSingleFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	if err := os.WriteFile("a.txt", []byte("hello"), 0o600); err != nil {
+		t.Fatalf("cannot write the file: %v", err)
+	}
+
+	resolved, err := local.New().ResolveSource(context.Background(), storage.Location{
+		Scheme: storage.SchemeFile,
+		Path:   "a.txt",
+	})
+	if err != nil {
+		t.Fatalf("ResolveSource() = %v", err)
+	}
+
+	reader, err := resolved.Endpoint.Open(context.Background(), resolved.FileKey)
+	if err != nil {
+		t.Fatalf("Open() = %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll() = %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("the file holds %q, want %q", got, "hello")
+	}
+}
+
+func TestDriverDeletesOnlyAnUnchangedFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	name := filepath.Join(root, "a.txt")
+	if err := os.WriteFile(name, []byte("old"), 0o600); err != nil {
+		t.Fatalf("cannot write the file: %v", err)
+	}
+
+	driver := local.New()
+	dest, err := driver.ResolveDest(context.Background(), storage.Location{
+		Scheme: storage.SchemeFile,
+		Path:   root,
+	}, false)
+	if err != nil {
+		t.Fatalf("ResolveDest() = %v", err)
+	}
+
+	info := listOne(t, dest.Endpoint, "a.txt")
+	if err := dest.Endpoint.(storage.ConditionalDeleter).
+		DeleteIfUnchanged(context.Background(), "a.txt", info); err != nil {
+		t.Fatalf("DeleteIfUnchanged() = %v", err)
+	}
+	if _, err := os.Stat(name); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("the unchanged file was kept, want it to be deleted")
+	}
+
+	// A file that changes after it was listed keeps its place.
+	if err := os.WriteFile(name, []byte("old"), 0o600); err != nil {
+		t.Fatalf("cannot write the file: %v", err)
+	}
+	info = listOne(t, dest.Endpoint, "a.txt")
+	if err := os.WriteFile(name, []byte("replaced"), 0o600); err != nil {
+		t.Fatalf("cannot replace the file: %v", err)
+	}
+	err = dest.Endpoint.(storage.ConditionalDeleter).DeleteIfUnchanged(context.Background(), "a.txt", info)
+	if !errors.Is(err, storage.ErrChanged) {
+		t.Errorf("DeleteIfUnchanged() = %v, want %v", err, storage.ErrChanged)
+	}
+	if _, err := os.Stat(name); err != nil {
+		t.Errorf("the changed file was removed: %v", err)
+	}
+}
+
+// listOne returns the information of a single file.
+func listOne(t *testing.T, endpoint storage.Endpoint, key string) storage.FileInfo {
+	t.Helper()
+
+	var found storage.FileInfo
+	if err := endpoint.List(context.Background(), key, func(info storage.FileInfo) error {
+		if info.Key == key {
+			found = info
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("List() = %v", err)
+	}
+	return found
 }

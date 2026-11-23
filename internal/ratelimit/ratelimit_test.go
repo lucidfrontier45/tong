@@ -2,6 +2,8 @@ package ratelimit
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -28,12 +30,17 @@ func (c *fakeClock) Now() time.Time {
 }
 
 // Sleep moves the fake clock forward by d and records the wait.
-func (c *fakeClock) Sleep(d time.Duration) {
+func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.now = c.now.Add(d)
 	c.slept += d
+	return nil
 }
 
 // advance moves the fake clock forward without recording a wait, which is
@@ -126,7 +133,9 @@ func TestWaitSpendsTheBudget(t *testing.T) {
 
 			clock.advance(tc.advance)
 			for _, n := range tc.waits {
-				limiter.Wait(n)
+				if err := limiter.Wait(t.Context(), n); err != nil {
+					t.Fatalf("Wait() = %v", err)
+				}
 			}
 
 			if got := clock.total(); got != tc.want {
@@ -143,7 +152,7 @@ func TestReaderThrottlesTheData(t *testing.T) {
 	limiter := New(1024, clock)
 	content := bytes.Repeat([]byte("x"), 3*1024)
 
-	got, err := io.ReadAll(limiter.Reader(bytes.NewReader(content)))
+	got, err := io.ReadAll(limiter.Reader(t.Context(), bytes.NewReader(content)))
 	if err != nil {
 		t.Fatalf("ReadAll() = %v", err)
 	}
@@ -159,7 +168,7 @@ func TestReaderDoesNotReadMoreThanOneSecondOfData(t *testing.T) {
 	t.Parallel()
 
 	limiter := New(1024, newFakeClock())
-	reader := limiter.Reader(bytes.NewReader(make([]byte, 8*1024)))
+	reader := limiter.Reader(t.Context(), bytes.NewReader(make([]byte, 8*1024)))
 
 	buf := make([]byte, 8*1024)
 	n, err := reader.Read(buf)
@@ -179,7 +188,7 @@ func TestReadersShareTheBudget(t *testing.T) {
 	content := bytes.Repeat([]byte("x"), 1024)
 
 	for range 2 {
-		if _, err := io.ReadAll(limiter.Reader(bytes.NewReader(content))); err != nil {
+		if _, err := io.ReadAll(limiter.Reader(t.Context(), bytes.NewReader(content))); err != nil {
 			t.Fatalf("ReadAll() = %v", err)
 		}
 	}
@@ -206,7 +215,9 @@ func TestLimiterIsSafeForConcurrentUse(t *testing.T) {
 	for range goroutines {
 		wg.Go(func() {
 			for range waits {
-				limiter.Wait(chunk)
+				if err := limiter.Wait(t.Context(), chunk); err != nil {
+					t.Errorf("Wait() = %v", err)
+				}
 			}
 		})
 	}
@@ -244,8 +255,39 @@ func TestRealClock(t *testing.T) {
 
 	clock := RealClock{}
 	start := clock.Now()
-	clock.Sleep(time.Millisecond)
+	if err := clock.Sleep(t.Context(), time.Millisecond); err != nil {
+		t.Fatalf("Sleep() = %v", err)
+	}
 	if clock.Now().Before(start) {
 		t.Error("the real clock went backwards")
+	}
+}
+
+func TestWaitStopsWhenTheContextIsDone(t *testing.T) {
+	t.Parallel()
+
+	limiter := New(1, newFakeClock())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := limiter.Wait(ctx, 10); !errors.Is(err, context.Canceled) {
+		t.Errorf("Wait() = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestReaderStopsWhenTheContextIsDone(t *testing.T) {
+	t.Parallel()
+
+	limiter := New(1024, newFakeClock())
+	ctx, cancel := context.WithCancel(t.Context())
+	reader := limiter.Reader(ctx, bytes.NewReader(make([]byte, 4*1024)))
+
+	if _, err := reader.Read(make([]byte, 512)); err != nil {
+		t.Fatalf("Read() = %v", err)
+	}
+
+	cancel()
+	if _, err := reader.Read(make([]byte, 512)); !errors.Is(err, context.Canceled) {
+		t.Errorf("Read() = %v, want %v", err, context.Canceled)
 	}
 }

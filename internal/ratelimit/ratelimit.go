@@ -7,6 +7,7 @@
 package ratelimit
 
 import (
+	"context"
 	"io"
 	"sync"
 	"time"
@@ -21,8 +22,9 @@ const maxRead = 1 << 20
 type Clock interface {
 	// Now returns the current time.
 	Now() time.Time
-	// Sleep waits for d to pass.
-	Sleep(d time.Duration)
+	// Sleep waits for d to pass, or returns the error of ctx when the wait
+	// is interrupted.
+	Sleep(ctx context.Context, d time.Duration) error
 }
 
 // RealClock is the clock of the running process.
@@ -31,8 +33,24 @@ type RealClock struct{}
 // Now returns the current time.
 func (RealClock) Now() time.Time { return time.Now() }
 
-// Sleep waits for d to pass.
-func (RealClock) Sleep(d time.Duration) { time.Sleep(d) }
+// Sleep waits for d to pass, or returns early when ctx is done.
+func (RealClock) Sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Limiter hands out bytes from a budget that refills at a fixed rate.
 //
@@ -72,12 +90,31 @@ func New(rate int64, clock Clock) *Limiter {
 	}
 }
 
-// Wait spends n bytes from the budget, blocking until they are available.
-func (l *Limiter) Wait(n int) {
+// Wait spends n bytes from the budget, blocking until they are available. It
+// returns the error of ctx when the wait is interrupted.
+func (l *Limiter) Wait(ctx context.Context, n int) error {
 	if n <= 0 {
-		return
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
+	wait := l.reserve(n)
+	if wait <= 0 {
+		return nil
+	}
+	return l.clock.Sleep(ctx, wait)
+}
+
+// reserve spends n bytes from the budget and returns how long the caller has
+// to wait for them.
+//
+// The wait itself happens outside the lock, so that one slow worker does not
+// hold up the others and a cancelled worker does not block them either. The
+// budget is still accounted for before the lock is released, because the
+// reservation moves last into the future.
+func (l *Limiter) reserve(n int) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -95,7 +132,7 @@ func (l *Limiter) Wait(n int) {
 	need := float64(n)
 	if l.tokens >= need {
 		l.tokens -= need
-		return
+		return 0
 	}
 
 	// The budget is in debt by the missing bytes. The next call sees a
@@ -106,13 +143,14 @@ func (l *Limiter) Wait(n int) {
 	l.tokens = 0
 	wait := max(time.Duration(missing/l.rate*float64(time.Second)), 0)
 	l.last = now.Add(wait)
-	l.clock.Sleep(wait)
+	return wait
 }
 
 // Reader wraps r so that every read spends its bytes from the budget, which
-// pushes the backpressure up to the sender.
-func (l *Limiter) Reader(r io.Reader) io.Reader {
-	return &reader{limiter: l, r: r}
+// pushes the backpressure up to the sender. A read returns the error of ctx
+// when the wait is interrupted, so that a cancelled transfer stops.
+func (l *Limiter) Reader(ctx context.Context, r io.Reader) io.Reader {
+	return &reader{ctx: ctx, limiter: l, r: r}
 }
 
 // chunk returns the largest read the limiter lets through at once: one
@@ -124,6 +162,7 @@ func (l *Limiter) chunk() int {
 
 // reader is a throttled reader.
 type reader struct {
+	ctx     context.Context
 	limiter *Limiter
 	r       io.Reader
 }
@@ -131,12 +170,17 @@ type reader struct {
 // Read reads from the underlying reader and then spends the bytes from the
 // budget.
 func (r *reader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
 	if chunk := r.limiter.chunk(); len(p) > chunk {
 		p = p[:chunk]
 	}
 	n, err := r.r.Read(p)
 	if n > 0 {
-		r.limiter.Wait(n)
+		if werr := r.limiter.Wait(r.ctx, n); werr != nil {
+			return 0, werr
+		}
 	}
 	return n, err
 }

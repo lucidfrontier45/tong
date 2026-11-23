@@ -32,6 +32,9 @@ var (
 	ErrUnsupportedScheme = errors.New("unsupported storage scheme")
 	// ErrNotFound is returned when a location does not exist.
 	ErrNotFound = errors.New("location not found")
+	// ErrChanged is returned by [ConditionalDeleter] when a file no longer
+	// matches the information the caller listed.
+	ErrChanged = errors.New("file changed since it was listed")
 )
 
 // FileInfo describes a single file or object.
@@ -45,6 +48,11 @@ type FileInfo struct {
 	ModTime time.Time
 	// Checksum is an optional provider checksum, such as an ETag.
 	Checksum string
+	// Version is an opaque token that identifies the revision of the file
+	// that was listed, such as its size and modification time or its ETag.
+	// The engine uses it to notice a file that changed after it was
+	// listed.
+	Version string
 }
 
 // Endpoint is a rooted view of a storage location.
@@ -111,6 +119,30 @@ type ModTimeAware interface {
 	// UseModTime tells the endpoint whether the modification times of the
 	// listed files matter.
 	UseModTime(enabled bool)
+}
+
+// Identifier is an optional capability: the backend can report a stable
+// identity for a key, so that the engine can tell whether a source and a
+// destination refer to the same file.
+//
+// Two keys that resolve to the same file return the same value. A local
+// backend returns the resolved absolute path, which also catches a file that
+// is reached through a symlink or a relative component; an object store
+// returns the bucket and the key.
+type Identifier interface {
+	// Identity returns the identity of the file stored under key.
+	Identity(ctx context.Context, key string) (string, error)
+}
+
+// ConditionalDeleter is an optional capability: the backend deletes a key
+// only while it still matches the information the caller listed, so that a
+// file that was replaced in between is not deleted.
+//
+// A delete that finds the file changed returns [ErrChanged] and leaves the
+// file in place.
+type ConditionalDeleter interface {
+	// DeleteIfUnchanged deletes key if it still matches info.
+	DeleteIfUnchanged(ctx context.Context, key string, info FileInfo) error
 }
 
 // Location is a parsed command-line location.
