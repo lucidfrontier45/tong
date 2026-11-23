@@ -44,8 +44,12 @@ func (d *Driver) ResolveSource(_ context.Context, loc storage.Location) (storage
 			return storage.Resolved{}, fmt.Errorf("%s: not a directory", loc.Path)
 		}
 		dir, file := filepath.Split(loc.Path)
+		endpoint, err := newEndpoint(dir)
+		if err != nil {
+			return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+		}
 		return storage.Resolved{
-			Endpoint: &endpoint{root: filepath.Clean(dir)},
+			Endpoint: endpoint,
 			FileKey:  file,
 			Display:  loc.Path,
 		}, nil
@@ -56,8 +60,12 @@ func (d *Driver) ResolveSource(_ context.Context, loc storage.Location) (storage
 	if !loc.Trailing {
 		name = filepath.Base(root)
 	}
+	endpoint, err := newEndpoint(root)
+	if err != nil {
+		return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+	}
 	return storage.Resolved{
-		Endpoint: &endpoint{root: root},
+		Endpoint: endpoint,
 		Name:     name,
 		IsDir:    true,
 		Display:  loc.Path,
@@ -69,38 +77,60 @@ func (d *Driver) ResolveDest(_ context.Context, loc storage.Location, singleFile
 	info, err := os.Stat(loc.Path)
 	switch {
 	case err == nil && info.IsDir():
-		return storage.Resolved{
-			Endpoint: &endpoint{root: filepath.Clean(loc.Path)},
-			IsDir:    true,
-			Display:  loc.Path,
-		}, nil
+		return dirDest(loc)
 	case err == nil:
 		// The destination already exists as a file. Only a single source
 		// file may be copied onto it.
-		return fileDest(loc), nil
+		return fileDest(loc)
 	case errors.Is(err, fs.ErrNotExist):
 		if singleFile {
 			// The destination holds the file that is copied.
-			return fileDest(loc), nil
+			return fileDest(loc)
 		}
-		return storage.Resolved{
-			Endpoint: &endpoint{root: filepath.Clean(loc.Path)},
-			IsDir:    true,
-			Display:  loc.Path,
-		}, nil
+		return dirDest(loc)
 	default:
 		return storage.Resolved{}, fmt.Errorf("cannot read %s: %w", loc.Path, err)
 	}
 }
 
-// fileDest resolves a destination that holds a single file.
-func fileDest(loc storage.Location) storage.Resolved {
-	dir, file := filepath.Split(loc.Path)
+// dirDest resolves a destination that is a directory.
+func dirDest(loc storage.Location) (storage.Resolved, error) {
+	endpoint, err := newEndpoint(loc.Path)
+	if err != nil {
+		return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+	}
 	return storage.Resolved{
-		Endpoint: &endpoint{root: filepath.Clean(dir)},
+		Endpoint: endpoint,
+		IsDir:    true,
+		Display:  loc.Path,
+	}, nil
+}
+
+// fileDest resolves a destination that holds a single file.
+func fileDest(loc storage.Location) (storage.Resolved, error) {
+	dir, file := filepath.Split(loc.Path)
+	endpoint, err := newEndpoint(dir)
+	if err != nil {
+		return storage.Resolved{}, fmt.Errorf("cannot resolve %s: %w", loc.Path, err)
+	}
+	return storage.Resolved{
+		Endpoint: endpoint,
 		Name:     file,
 		Display:  loc.Path,
+	}, nil
+}
+
+// newEndpoint returns an endpoint rooted at a directory.
+//
+// The root is held as an absolute path, so that a relative location resolves
+// the same way from any working directory and so that two endpoints can be
+// compared by path.
+func newEndpoint(dir string) (*endpoint, error) {
+	root, err := filepath.Abs(filepath.Clean(dir))
+	if err != nil {
+		return nil, err
 	}
+	return &endpoint{root: root}, nil
 }
 
 // endpoint is a rooted view of a local directory.
