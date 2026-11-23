@@ -134,6 +134,13 @@ type Identifier interface {
 	Identity(ctx context.Context, key string) (string, error)
 }
 
+// EntryIdentifier identifies the entry that Create replaces and Delete
+// removes. Unlike [Identifier], it does not follow a link at the final name.
+type EntryIdentifier interface {
+	// EntryIdentity returns the identity of the entry, even if not yet created.
+	EntryIdentity(ctx context.Context, key string) (string, error)
+}
+
 // ConditionalDeleter is an optional capability: the backend deletes a key
 // only while it still matches the information the caller listed, so that a
 // file that was replaced in between is not deleted.

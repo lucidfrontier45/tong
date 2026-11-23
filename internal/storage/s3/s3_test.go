@@ -86,9 +86,11 @@ func TestIntegration(t *testing.T) {
 	}
 
 	var keys []string
+	var listed storage.FileInfo
 	if err := dest.Endpoint.List(ctx, "", func(info storage.FileInfo) error {
 		keys = append(keys, info.Key)
 		if info.Key == "a.txt" {
+			listed = info
 			if info.Size != int64(len(content)) {
 				t.Errorf("size = %d, want %d", info.Size, len(content))
 			}
@@ -133,6 +135,39 @@ func TestIntegration(t *testing.T) {
 	if !bytes.Equal(got, content) {
 		t.Errorf("the object holds %q, want %q", got, content)
 	}
+
+	t.Run("ConditionalDelete", func(t *testing.T) {
+		ctx := t.Context()
+		deleter, ok := dest.Endpoint.(storage.ConditionalDeleter)
+		if !ok {
+			t.Fatal("S3 endpoint does not support conditional removal")
+		}
+		if listed.Version == "" {
+			t.Fatal("the original object's listing has no ETag")
+		}
+		const replacement = "replacement object"
+		if err := dest.Endpoint.Create(ctx, "a.txt", modTime, strings.NewReader(replacement)); err != nil {
+			t.Fatalf("replace object: %v", err)
+		}
+		err := deleter.DeleteIfUnchanged(ctx, "a.txt", listed)
+		if apiErr, ok := errors.AsType[interface {
+			error
+			ErrorCode() string
+		}](err); !ok || apiErr.ErrorCode() != "PreconditionFailed" {
+			t.Errorf("conditional delete with stale ETag = %v, want PreconditionFailed", err)
+		}
+		body, err := dest.Endpoint.Open(ctx, "a.txt")
+		if err != nil {
+			t.Fatalf("open replacement: %v", err)
+		}
+		data, err := io.ReadAll(body)
+		if err := errors.Join(err, body.Close()); err != nil {
+			t.Fatalf("read replacement: %v", err)
+		}
+		if string(data) != replacement {
+			t.Errorf("replacement holds %q, want %q", data, replacement)
+		}
+	})
 
 	// An object that is gone is reported as missing, so that the engine
 	// can tell it from a failed transfer.

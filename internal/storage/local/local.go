@@ -334,15 +334,48 @@ func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if real, err := filepath.EvalSymlinks(full); err == nil {
-		full = real
-	} else {
-		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(full))
-		if parentErr == nil {
-			full = filepath.Join(parent, filepath.Base(full))
-		}
+	return filepath.EvalSymlinks(full)
+}
+
+// EntryIdentity resolves parent directories, but keeps the final name
+// because Create replaces that entry instead of following a final symlink.
+func (e *endpoint) EntryIdentity(_ context.Context, key string) (string, error) {
+	full, err := e.resolve(key)
+	if err != nil {
+		return "", err
 	}
-	return full, nil
+	parent, err := resolveParent(filepath.Dir(full))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(full)), nil
+}
+
+// resolveParent resolves the longest existing prefix before appending any
+// directories that Create will make.
+func resolveParent(dir string) (string, error) {
+	real, err := filepath.EvalSymlinks(dir)
+	if err == nil {
+		return real, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	// A dangling symlink is not a directory that Create can make.
+	if _, statErr := os.Lstat(dir); statErr == nil {
+		return "", err
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return "", statErr
+	}
+	parent := filepath.Dir(dir)
+	if parent == dir {
+		return "", err
+	}
+	real, err = resolveParent(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(real, filepath.Base(dir)), nil
 }
 
 // DeleteIfUnchanged removes the file stored under key when it still matches

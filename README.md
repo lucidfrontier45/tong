@@ -305,10 +305,15 @@ exit 1 before anything is written or deleted.
 **How a move checks a source before removing it.** A local file is compared by
 size, modification time, and filesystem identity, so replacing it with a
 same-size, same-mtime file is detected. S3 removal uses an atomic conditional
-delete on the listed ETag; endpoints that do not support conditional deletes
-fail closed. A source that changed between listing and removal is kept and
-the run exits 23. Moves also reject aliased destination paths and overlapping
-source/destination mappings before writing or deleting anything.
+delete on the listed ETag. Use `--remove-source-files` with S3-compatible
+endpoints only if they enforce `If-Match` on `DeleteObject`; an endpoint that
+ignores the header can delete a replacement object. LocalStack 3.8.1 is one
+such endpoint. When the check detects a changed source, tong keeps it and
+exits 23. Moves also reject two writes to the
+same destination entry (including through directory symlinks) and overlapping
+source/destination mappings before writing or deleting anything. Destination
+pruning keeps the entries targeted by a transfer, even through directory
+symlinks.
 
 **Why part concurrency is not `--parallel`.** The SDK allocates
 `Concurrency+1` part buffers per object, so tying part concurrency to the

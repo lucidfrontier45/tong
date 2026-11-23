@@ -495,9 +495,8 @@ func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
 // DeleteIfUnchanged removes an object when its ETag still matches the one
 // that was listed.
 //
-// The delete is conditional on the ETag observed during listing. Endpoints
-// that do not support conditional deletes fail closed rather than deleting an
-// object that may have changed since it was copied.
+// The delete is conditional on the ETag observed during listing. S3-compatible
+// endpoints must enforce If-Match for this to protect a replacement object.
 func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info storage.FileInfo) error {
 	if info.Version == "" {
 		return fmt.Errorf("%w: s3://%s/%s has no ETag", storage.ErrChanged, e.bucket, e.key(key))

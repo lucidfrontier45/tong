@@ -11,7 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,11 +121,11 @@ type plan struct {
 	dest storage.Resolved
 	// destFiles holds the files that the destination currently has.
 	destFiles map[string]storage.FileInfo
-	// planned holds the destination keys that the sources provide.
-	planned map[string]bool
-	// owners maps a destination key to the source file that provides it, so
-	// that two sources that write one key are noticed.
+	// owners maps each planned destination entry to the source that
+	// provides it. Both collision detection and pruning use this map.
 	owners map[string]string
+	// prune holds the destination keys to delete after the transfers.
+	prune []string
 	// collisions holds the destination keys that more than one source
 	// provides, which makes a move ambiguous.
 	collisions []collision
@@ -212,7 +212,6 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 		matcher:   matcher,
 		dest:      dest,
 		destFiles: destFiles,
-		planned:   make(map[string]bool),
 		owners:    make(map[string]string),
 		limiter:   ratelimit.New(opts.BWLimit, nil),
 	}
@@ -242,6 +241,14 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 		}
 	}
 
+	p.prune, err = p.deletions(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return CodeSignal
+		}
+		_, _ = fmt.Fprintf(stderr, "tong: cannot plan destination deletions: %v\n", err)
+		return CodePartial
+	}
 	return p.execute(ctx, stdout, stderr)
 }
 
@@ -305,15 +312,13 @@ func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
 		if err != nil {
 			return err
 		}
-		p.consider(ctx, src, src.FileKey, info)
-		return nil
+		return p.consider(ctx, src, src.FileKey, info)
 	}
 
 	if !p.opts.Recursive {
 		if shallow, ok := src.Endpoint.(storage.ShallowLister); ok {
 			return shallow.ListShallow(ctx, "", func(info storage.FileInfo) error {
-				p.consider(ctx, src, info.Key, info)
-				return nil
+				return p.consider(ctx, src, info.Key, info)
 			})
 		}
 		// The backend cannot list a single level, so fall back to a full
@@ -322,42 +327,36 @@ func (p *plan) addSource(ctx context.Context, src storage.Resolved) error {
 			if strings.Contains(info.Key, "/") {
 				return nil
 			}
-			p.consider(ctx, src, info.Key, info)
-			return nil
+			return p.consider(ctx, src, info.Key, info)
 		})
 	}
 
 	return src.Endpoint.List(ctx, "", func(info storage.FileInfo) error {
-		p.consider(ctx, src, info.Key, info)
-		return nil
+		return p.consider(ctx, src, info.Key, info)
 	})
 }
 
 // consider decides whether a source file has to be copied.
-func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, info storage.FileInfo) {
+func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, info storage.FileInfo) error {
 	destKey := p.destKey(src, key)
 
 	// The filters match the path of the file in the destination, which is
 	// the transfer root that rsync uses. A source without a trailing
 	// separator keeps its own name in that path.
 	if !p.matcher.Match(destKey, false) {
-		return
+		return nil
 	}
 	if p.opts.MinSize > 0 && info.Size < p.opts.MinSize {
-		return
+		return nil
 	}
 	if p.opts.MaxSize > 0 && info.Size > p.opts.MaxSize {
-		return
+		return nil
 	}
 
-	p.planned[destKey] = true
-
 	source := srcDisplay(src, key)
-	ownerKey := destKey
-	if identifier, ok := p.dest.Endpoint.(storage.Identifier); ok {
-		if identity, err := identifier.Identity(ctx, destKey); err == nil {
-			ownerKey = identity
-		}
+	ownerKey, err := p.destinationEntry(ctx, destKey)
+	if err != nil {
+		return fmt.Errorf("cannot identify destination %s: %w", p.destPath(destKey), err)
 	}
 	if first, ok := p.owners[ownerKey]; ok {
 		// A copy keeps rsync's order: the first source that provides the
@@ -365,7 +364,7 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 		if first != source && p.opts.RemoveSourceFiles {
 			p.collisions = append(p.collisions, collision{dest: destKey, first: first, second: source})
 		}
-		return
+		return nil
 	}
 	p.owners[ownerKey] = source
 
@@ -377,14 +376,14 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 		p.stats.skipped.Add(1)
 		p.stats.errors.Add(1)
 		p.refused = append(p.refused, source)
-		return
+		return nil
 	}
 
 	dst, exists := p.destFiles[destKey]
 	switch compare(info, dst, exists, p.opts) {
 	case decisionExcluded:
 		// The file is not part of the transfer list.
-		return
+		return nil
 	case decisionInSync:
 		// The destination already holds the file. rsync removes such a
 		// source too, so the file is in sync either way.
@@ -399,7 +398,7 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 				info:    info,
 			})
 		}
-		return
+		return nil
 	case decisionTransfer:
 		p.stats.total.Add(1)
 	}
@@ -411,6 +410,19 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 		destKey:    destKey,
 		info:       info,
 	})
+	return nil
+}
+
+// destinationEntry identifies the entry that writes and pruning would touch.
+func (p *plan) destinationEntry(ctx context.Context, key string) (string, error) {
+	switch endpoint := p.dest.Endpoint.(type) {
+	case storage.EntryIdentifier:
+		return endpoint.EntryIdentity(ctx, key)
+	case storage.Identifier:
+		return endpoint.Identity(ctx, key)
+	default:
+		return key, nil
+	}
 }
 
 // sameFile reports whether the source file and the destination key it maps to
@@ -641,7 +653,7 @@ func (p *plan) removeSynced(ctx context.Context, stderr io.Writer) int {
 // provide and returns the number of deletions that failed.
 func (p *plan) deleteExtraneous(ctx context.Context, stdout, stderr io.Writer) int {
 	failed := 0
-	for _, key := range p.deletions() {
+	for _, key := range p.prune {
 		if ctx.Err() != nil {
 			return failed
 		}
@@ -664,7 +676,7 @@ func (p *plan) preview(stdout io.Writer) {
 	for _, it := range p.items {
 		p.print(stdout, "would copy %s -> %s\n", it.srcDisplay, p.destPath(it.destKey))
 	}
-	for _, key := range p.deletions() {
+	for _, key := range p.prune {
 		p.print(stdout, "would delete %s\n", p.destPath(key))
 	}
 	if !p.opts.RemoveSourceFiles {
@@ -715,31 +727,38 @@ func (p *plan) print(w io.Writer, format string, args ...any) {
 }
 
 // deletions returns the destination keys that the sources do not provide.
-func (p *plan) deletions() []string {
+func (p *plan) deletions(ctx context.Context) ([]string, error) {
 	if !p.opts.Delete {
-		return nil
+		return nil, nil
 	}
 	if !p.opts.Recursive {
 		// Without recursion the transfer only covers the top level, so
 		// nothing below it may be deleted. rsync refuses the combination
 		// outright; tong only leaves the destination alone.
-		return nil
+		return nil, nil
 	}
 
 	var keys []string
 	for key := range p.destFiles {
-		if p.planned[key] {
-			continue
-		}
 		if p.matcher.Excluded(key, false) {
 			// Excluded files are protected from deletion, the way rsync
 			// protects them.
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		entry, err := p.destinationEntry(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if _, planned := p.owners[entry]; planned {
+			continue
+		}
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
-	return keys
+	slices.Sort(keys)
+	return keys, nil
 }
 
 // copyFile copies a single file from a source to the destination and

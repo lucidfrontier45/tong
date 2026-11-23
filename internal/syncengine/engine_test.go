@@ -1238,6 +1238,88 @@ func TestRunRefusesOverlappingMoveTrees(t *testing.T) {
 	}
 }
 
+func TestRunRefusesAliasedMoveWithMissingDestinationParents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src, dest := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	first, second := filepath.Join(src, "a", "sub", "file"), filepath.Join(src, "b", "sub", "file")
+	writeFile(t, first, "alpha")
+	writeFile(t, second, "beta")
+	if err := os.MkdirAll(filepath.Join(dest, "a"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a", filepath.Join(dest, "b")); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+
+	code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, resolveDest(t, dest+"/"),
+		Options{Recursive: true, RemoveSourceFiles: true}, io.Discard, io.Discard)
+	if code != CodeUsage {
+		t.Fatalf("Run() = %d, want %d", code, CodeUsage)
+	}
+	if readFile(t, first) != "alpha" || readFile(t, second) != "beta" {
+		t.Error("move changed the sources")
+	}
+	if _, err := os.Stat(filepath.Join(dest, "a", "sub")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("destination subdirectory should not exist: %v", err)
+	}
+}
+
+func TestRunMoveWithDeleteKeepsAliasedDestination(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src, dest := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	source, target := filepath.Join(src, "b", "file"), filepath.Join(dest, "a", "file")
+	extra := filepath.Join(dest, "extra")
+	writeFile(t, source, "incoming")
+	writeFile(t, target, "old")
+	writeFile(t, extra, "extraneous")
+	if err := os.Symlink("a", filepath.Join(dest, "b")); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+
+	code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, resolveDest(t, dest+"/"),
+		Options{Recursive: true, RemoveSourceFiles: true, Delete: true}, io.Discard, io.Discard)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+	if got := readFile(t, target); got != "incoming" {
+		t.Errorf("destination = %q, want incoming", got)
+	}
+	for _, name := range []string{source, extra} {
+		if _, err := os.Stat(name); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s should have been removed: %v", name, err)
+		}
+	}
+}
+
+func TestRunCopyReplacesDestinationLeafSymlink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src, dest := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	writeFile(t, filepath.Join(src, "a"), "alpha")
+	writeFile(t, filepath.Join(src, "b"), "beta")
+	writeFile(t, filepath.Join(dest, "a"), "old")
+	if err := os.Symlink("a", filepath.Join(dest, "b")); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+
+	code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, resolveDest(t, dest+"/"),
+		Options{Recursive: true, Parallel: 2}, io.Discard, io.Discard)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+	if got := readFile(t, filepath.Join(dest, "a")); got != "alpha" {
+		t.Errorf("destination a = %q, want alpha", got)
+	}
+	if got := readFile(t, filepath.Join(dest, "b")); got != "beta" {
+		t.Errorf("destination b = %q, want beta", got)
+	}
+}
+
 func TestRunLetsTheFirstSourceWinACopyCollision(t *testing.T) {
 	t.Parallel()
 
