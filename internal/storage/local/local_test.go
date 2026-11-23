@@ -274,6 +274,41 @@ func TestDriverDeletesOnlyAnUnchangedFile(t *testing.T) {
 	}
 }
 
+func TestDriverDoesNotDeleteMetadataPreservingReplacement(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	name := filepath.Join(root, "a.txt")
+	if err := os.WriteFile(name, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	driver := local.New()
+	dest, err := driver.ResolveDest(context.Background(), storage.Location{Scheme: storage.SchemeFile, Path: root}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := listOne(t, dest.Endpoint, "a.txt")
+	mtime := info.ModTime
+	replacement := filepath.Join(root, "replacement")
+	if err := os.WriteFile(replacement, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, name); err != nil {
+		t.Fatal(err)
+	}
+	err = dest.Endpoint.(storage.ConditionalDeleter).DeleteIfUnchanged(context.Background(), "a.txt", info)
+	if !errors.Is(err, storage.ErrChanged) {
+		t.Errorf("DeleteIfUnchanged() = %v, want ErrChanged", err)
+	}
+	data, err := os.ReadFile(name) //nolint:gosec // name is inside the test's temporary directory
+	if err != nil || string(data) != "new" {
+		t.Errorf("replacement contents = %q, %v; want new file retained", data, err)
+	}
+}
+
 // listOne returns the information of a single file.
 func listOne(t *testing.T, endpoint storage.Endpoint, key string) storage.FileInfo {
 	t.Helper()

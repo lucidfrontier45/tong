@@ -303,12 +303,12 @@ exit 23, and two sources that would write one destination key are refused with
 exit 1 before anything is written or deleted.
 
 **How a move checks a source before removing it.** A local file is compared by
-size and modification time, an S3 object by its ETag. The check is a request
-of its own rather than an atomic conditional delete, because the
-S3-compatible services tong targets do not all implement conditional deletes;
-the window between the check and the delete is therefore the same one rsync
-has. A source that changed in that window, or between the listing and the
-removal, is kept and the run exits 23.
+size, modification time, and filesystem identity, so replacing it with a
+same-size, same-mtime file is detected. S3 removal uses an atomic conditional
+delete on the listed ETag; endpoints that do not support conditional deletes
+fail closed. A source that changed between listing and removal is kept and
+the run exits 23. Moves also reject aliased destination paths and overlapping
+source/destination mappings before writing or deleting anything.
 
 **Why part concurrency is not `--parallel`.** The SDK allocates
 `Concurrency+1` part buffers per object, so tying part concurrency to the

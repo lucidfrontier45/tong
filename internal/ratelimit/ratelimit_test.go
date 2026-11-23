@@ -145,6 +145,19 @@ func TestWaitSpendsTheBudget(t *testing.T) {
 	}
 }
 
+func TestConcurrentReservationIncludesEarlierDebt(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	limiter := New(1024, clock)
+	if got := limiter.reserve(2048); got != 2*time.Second {
+		t.Fatalf("first reservation waits %v, want 2s", got)
+	}
+	if got := limiter.reserve(2048); got != 4*time.Second {
+		t.Errorf("second reservation waits %v, want 4s", got)
+	}
+}
+
 func TestReaderThrottlesTheData(t *testing.T) {
 	t.Parallel()
 

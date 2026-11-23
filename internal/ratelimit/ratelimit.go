@@ -141,9 +141,9 @@ func (l *Limiter) reserve(n int) time.Duration {
 	// second's worth of data at a time.
 	missing := need - l.tokens
 	l.tokens = 0
-	wait := max(time.Duration(missing/l.rate*float64(time.Second)), 0)
-	l.last = now.Add(wait)
-	return wait
+	service := max(time.Duration(missing/l.rate*float64(time.Second)), 0)
+	l.last = now.Add(service)
+	return max(l.last.Sub(l.clock.Now()), 0)
 }
 
 // Reader wraps r so that every read spends its bytes from the budget, which

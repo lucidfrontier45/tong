@@ -1188,6 +1188,56 @@ func TestRunRefusesToMoveWhenTwoSourcesWriteOneKey(t *testing.T) {
 	}
 }
 
+func TestRunRefusesAliasedDestinationDirectoriesInMove(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a", "file"), "AAAA")
+	writeFile(t, filepath.Join(dir, "b", "file"), "BBBB")
+	dest := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(filepath.Join(dest, "a"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dest, "a"), filepath.Join(dest, "b")); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+
+	code := Run(t.Context(), []storage.Resolved{
+		resolveSource(t, filepath.Join(dir, "a")),
+		resolveSource(t, filepath.Join(dir, "b")),
+	}, resolveDest(t, dest), Options{Recursive: true, RemoveSourceFiles: true}, io.Discard, io.Discard)
+	if code != CodeUsage {
+		t.Fatalf("Run() = %d, want %d", code, CodeUsage)
+	}
+	if got := readFile(t, filepath.Join(dir, "a", "file")); got != "AAAA" {
+		t.Errorf("first source = %q, want it kept", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "b", "file")); got != "BBBB" {
+		t.Errorf("second source = %q, want it kept", got)
+	}
+}
+
+func TestRunRefusesOverlappingMoveTrees(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "tree", "x"), "outer")
+	writeFile(t, filepath.Join(dir, "tree", "sub", "x"), "inner")
+	dest := filepath.Join(dir, "tree", "sub")
+
+	code := Run(t.Context(), []storage.Resolved{resolveSource(t, filepath.Join(dir, "tree")+"/")},
+		resolveDest(t, dest+"/"), Options{Recursive: true, RemoveSourceFiles: true}, io.Discard, io.Discard)
+	if code != CodeUsage {
+		t.Fatalf("Run() = %d, want %d", code, CodeUsage)
+	}
+	if got := readFile(t, filepath.Join(dir, "tree", "x")); got != "outer" {
+		t.Errorf("outer source = %q, want it kept", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "tree", "sub", "x")); got != "inner" {
+		t.Errorf("inner source = %q, want it kept", got)
+	}
+}
+
 func TestRunLetsTheFirstSourceWinACopyCollision(t *testing.T) {
 	t.Parallel()
 

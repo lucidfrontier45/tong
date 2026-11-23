@@ -157,6 +157,7 @@ type collision struct {
 type removal struct {
 	src     storage.Endpoint
 	key     string
+	destKey string
 	display string
 	info    storage.FileInfo
 }
@@ -234,8 +235,55 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 		_, _ = fmt.Fprintln(stderr, "tong: refusing to remove source files when two sources write one destination")
 		return CodeUsage
 	}
+	if opts.RemoveSourceFiles {
+		if err := p.checkOverlappingMove(ctx); err != nil {
+			_, _ = fmt.Fprintf(stderr, "tong: refusing overlapping move: %v\n", err)
+			return CodeUsage
+		}
+	}
 
 	return p.execute(ctx, stdout, stderr)
+}
+
+// checkOverlappingMove rejects a move that would overwrite a source planned
+// for removal through another source-to-destination mapping.
+func (p *plan) checkOverlappingMove(ctx context.Context) error {
+	destinations, ok := p.dest.Endpoint.(storage.Identifier)
+	if !ok {
+		return nil
+	}
+	sources := make(map[string]string)
+	for _, it := range p.items {
+		if identifier, ok := it.src.(storage.Identifier); ok {
+			if identity, err := identifier.Identity(ctx, it.srcKey); err == nil {
+				sources[identity] = it.srcDisplay
+			}
+		}
+	}
+	for _, r := range p.removals {
+		if identifier, ok := r.src.(storage.Identifier); ok {
+			if identity, err := identifier.Identity(ctx, r.key); err == nil {
+				sources[identity] = r.display
+			}
+		}
+	}
+	checks := make(map[string]string, len(p.items)+len(p.removals))
+	for _, it := range p.items {
+		checks[it.destKey] = it.srcDisplay
+	}
+	for _, r := range p.removals {
+		checks[r.destKey] = r.display
+	}
+	for destKey, display := range checks {
+		identity, err := destinations.Identity(ctx, destKey)
+		if err != nil {
+			continue
+		}
+		if source, exists := sources[identity]; exists && source != display {
+			return fmt.Errorf("%s is also the destination of %s", source, display)
+		}
+	}
+	return nil
 }
 
 // useModTime tells an endpoint whether the modification times of the files
@@ -305,7 +353,13 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 	p.planned[destKey] = true
 
 	source := srcDisplay(src, key)
-	if first, ok := p.owners[destKey]; ok {
+	ownerKey := destKey
+	if identifier, ok := p.dest.Endpoint.(storage.Identifier); ok {
+		if identity, err := identifier.Identity(ctx, destKey); err == nil {
+			ownerKey = identity
+		}
+	}
+	if first, ok := p.owners[ownerKey]; ok {
 		// A copy keeps rsync's order: the first source that provides the
 		// key wins, and a source listed twice is simply the same file.
 		if first != source && p.opts.RemoveSourceFiles {
@@ -313,7 +367,7 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 		}
 		return
 	}
-	p.owners[destKey] = source
+	p.owners[ownerKey] = source
 
 	// A source that resolves to the destination itself is the only copy
 	// there is. Copying it onto itself would do nothing and removing it
@@ -340,6 +394,7 @@ func (p *plan) consider(ctx context.Context, src storage.Resolved, key string, i
 			p.removals = append(p.removals, removal{
 				src:     src.Endpoint,
 				key:     key,
+				destKey: destKey,
 				display: source,
 				info:    info,
 			})
@@ -448,6 +503,10 @@ func (p *plan) execute(ctx context.Context, stdout, stderr io.Writer) int {
 	// The extraneous files of the destination are deleted after the
 	// transfers, the way rsync does it.
 	failed += p.deleteExtraneous(ctx, stdout, stderr)
+	if ctx.Err() != nil {
+		p.report(stdout)
+		return CodeSignal
+	}
 
 	p.report(stdout)
 
@@ -564,6 +623,9 @@ func deleteSource(ctx context.Context, src storage.Endpoint, key string, info st
 func (p *plan) removeSynced(ctx context.Context, stderr io.Writer) int {
 	failed := 0
 	for _, r := range p.removals {
+		if ctx.Err() != nil {
+			return failed
+		}
 		if err := deleteSource(ctx, r.src, r.key, r.info); err != nil {
 			failed++
 			p.stats.errors.Add(1)
@@ -580,6 +642,9 @@ func (p *plan) removeSynced(ctx context.Context, stderr io.Writer) int {
 func (p *plan) deleteExtraneous(ctx context.Context, stdout, stderr io.Writer) int {
 	failed := 0
 	for _, key := range p.deletions() {
+		if ctx.Err() != nil {
+			return failed
+		}
 		if err := p.dest.Endpoint.Delete(ctx, key); err != nil {
 			failed++
 			p.stats.errors.Add(1)

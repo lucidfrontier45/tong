@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -335,6 +336,11 @@ func (e *endpoint) Identity(_ context.Context, key string) (string, error) {
 	}
 	if real, err := filepath.EvalSymlinks(full); err == nil {
 		full = real
+	} else {
+		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(full))
+		if parentErr == nil {
+			full = filepath.Join(parent, filepath.Base(full))
+		}
 	}
 	return full, nil
 }
@@ -366,8 +372,16 @@ func (e *endpoint) DeleteIfUnchanged(ctx context.Context, key string, info stora
 // before it removes a source, with the sub-second resolution that the
 // filesystem offers.
 func versionOf(info fs.FileInfo) string {
-	return strconv.FormatInt(info.Size(), 10) + ":" +
-		strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	version := strconv.FormatInt(info.Size(), 10) + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	sys := reflect.ValueOf(info.Sys())
+	if sys.IsValid() && sys.Kind() == reflect.Pointer && !sys.IsNil() {
+		sys = sys.Elem()
+		device, inode := sys.FieldByName("Dev"), sys.FieldByName("Ino")
+		if device.IsValid() && inode.IsValid() && device.CanUint() && inode.CanUint() {
+			return version + ":" + strconv.FormatUint(device.Uint(), 10) + ":" + strconv.FormatUint(inode.Uint(), 10)
+		}
+	}
+	return version
 }
 
 // contextReader stops a copy when ctx is done, so that a cancelled run does
