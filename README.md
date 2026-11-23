@@ -311,8 +311,9 @@ S3 endpoints, including overrides from the AWS SDK configuration. Pass
 `--s3-trust-conditional-delete` only after verifying the endpoint enforces
 `If-Match` on `DeleteObject`. An endpoint that ignores the header, such as
 LocalStack 3.8.1, can delete a replacement object. Copies to or from these
-endpoints do not require the flag. When the check detects a changed source,
-tong keeps it and exits 23.
+endpoints do not require the flag. Before removing an already-in-sync source,
+tong also rechecks the destination. If the destination disappeared or either
+file changed since listing, tong keeps the source and exits 23.
 
 Before writing or deleting anything, moves reject multiple writes to the
 same destination entry, conflicting local file/directory destinations, and

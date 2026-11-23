@@ -1354,6 +1354,41 @@ func TestRunMovesFromParentOfSymlinkTarget(t *testing.T) {
 	}
 }
 
+func TestRunCreatesDestinationWithParentTraversal(t *testing.T) {
+	t.Parallel()
+
+	for _, symlink := range []bool{false, true} {
+		dir := t.TempDir()
+		src := filepath.Join(dir, "src")
+		writeFile(t, filepath.Join(src, "file"), "payload")
+		parent := filepath.Join(dir, "parent")
+		sub := filepath.Join(parent, "sub")
+		if err := os.MkdirAll(sub, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		through := sub
+		if symlink {
+			through = filepath.Join(dir, "link")
+			if err := os.Symlink(sub, through); err != nil {
+				t.Skipf("cannot create symlink: %v", err)
+			}
+		}
+
+		raw := through + "/../new-dest/nested/"
+		code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, resolveDest(t, raw),
+			Options{Recursive: true}, io.Discard, io.Discard)
+		if code != CodeOK {
+			t.Fatalf("Run(symlink=%v) = %d, want %d", symlink, code, CodeOK)
+		}
+		if got := readFile(t, filepath.Join(parent, "new-dest", "nested", "file")); got != "payload" {
+			t.Errorf("copied %q, want payload", got)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "new-dest")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("lexically cleaned destination should not exist: %v", err)
+		}
+	}
+}
+
 func TestRunRefusesMovingFileOverDestinationAncestor(t *testing.T) {
 	t.Parallel()
 
@@ -1486,6 +1521,68 @@ func TestRunKeepsAChangedSource(t *testing.T) {
 	if !strings.Contains(stderr.String(), "file changed since it was listed") {
 		t.Errorf("the diagnostics are %q, want the change to be reported", stderr)
 	}
+}
+
+func TestRunKeepsSyncedSourceIfDestinationDisappearsOrChanges(t *testing.T) {
+	t.Parallel()
+
+	for _, replace := range []bool{false, true} {
+		dir := t.TempDir()
+		src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+		source, synced := filepath.Join(src, "synced"), filepath.Join(dst, "synced")
+		writeFile(t, source, "original")
+		writeFile(t, synced, "original")
+		writeFile(t, filepath.Join(src, "transfer"), "copy me")
+		stamp := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		for _, name := range []string{source, synced} {
+			if err := os.Chtimes(name, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+		}
+		replacement := filepath.Join(dir, "replacement")
+		if replace {
+			// Same size and mtime, but a different file.
+			writeFile(t, replacement, "replaced")
+			if err := os.Chtimes(replacement, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dest := resolveDest(t, dst+"/")
+		dest.Endpoint = &beforeWriteEndpoint{Endpoint: dest.Endpoint, beforeWrite: func() error {
+			if replace {
+				return os.Rename(replacement, synced)
+			}
+			return os.Remove(synced)
+		}}
+
+		stderr := &bytes.Buffer{}
+		code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, dest,
+			Options{Recursive: true, RemoveSourceFiles: true}, io.Discard, stderr)
+		if code != CodePartial || !strings.Contains(stderr.String(), synced) {
+			t.Fatalf("Run(replace=%v) = %d, stderr = %q; want destination reported and exit %d",
+				replace, code, stderr.String(), CodePartial)
+		}
+		if got := readFile(t, source); got != "original" {
+			t.Errorf("synced source holds %q, want original", got)
+		}
+		if got := readFile(t, filepath.Join(dst, "transfer")); got != "copy me" {
+			t.Errorf("unrelated transfer holds %q, want copy me", got)
+		}
+	}
+}
+
+// beforeWriteEndpoint injects a destination change during an unrelated copy.
+type beforeWriteEndpoint struct {
+	storage.Endpoint
+	beforeWrite func() error
+}
+
+// Create applies the change before writing the file.
+func (e *beforeWriteEndpoint) Create(ctx context.Context, key string, modTime time.Time, r io.Reader) error {
+	if err := e.beforeWrite(); err != nil {
+		return err
+	}
+	return e.Endpoint.Create(ctx, key, modTime, r)
 }
 
 func TestRunStopsRemovingWhenCancelled(t *testing.T) {

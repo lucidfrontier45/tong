@@ -665,7 +665,7 @@ func (p *plan) removeSynced(ctx context.Context, stderr io.Writer) int {
 		if ctx.Err() != nil {
 			return failed
 		}
-		if err := deleteSource(ctx, r.src, r.key, r.info); err != nil {
+		if err := p.removeSyncedFile(ctx, r); err != nil {
 			failed++
 			p.stats.errors.Add(1)
 			p.print(stderr, "tong: %v\n", err)
@@ -674,6 +674,24 @@ func (p *plan) removeSynced(ctx context.Context, stderr io.Writer) int {
 		p.stats.removed.Add(1)
 	}
 	return failed
+}
+
+// removeSyncedFile only deletes a skipped source if the destination still
+// matches what the plan saw before any transfers began.
+func (p *plan) removeSyncedFile(ctx context.Context, r removal) error {
+	current, err := lookup(ctx, p.dest.Endpoint, r.destKey)
+	if err != nil {
+		return fmt.Errorf("cannot verify destination %s: %w", p.destPath(r.destKey), err)
+	}
+	listed := p.destFiles[r.destKey]
+	if current.Version != listed.Version || current.Checksum != listed.Checksum ||
+		current.Size != listed.Size || !current.ModTime.Equal(listed.ModTime) {
+		return fmt.Errorf("destination %s: %w", p.destPath(r.destKey), storage.ErrChanged)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return deleteSource(ctx, r.src, r.key, r.info)
 }
 
 // deleteExtraneous deletes the destination files that the sources do not

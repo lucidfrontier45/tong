@@ -133,7 +133,7 @@ func newEndpoint(dir string) (*endpoint, error) {
 	// Cleaning a path with ".." before resolving symlinks can select a
 	// different directory than the OS did when it statted the input.
 	if hasParentComponent(dir) {
-		resolved, err := filepath.EvalSymlinks(dir)
+		resolved, err := resolveParent(dir)
 		if err != nil {
 			return nil, err
 		}
@@ -420,21 +420,30 @@ func resolveParent(dir string) (string, error) {
 	if !errors.Is(err, fs.ErrNotExist) {
 		return "", err
 	}
+	// Split without cleaning: an unresolved parent can still contain
+	// symlinks followed by "..". Trim trailing separators so that Lstat
+	// detects a dangling link rather than looking for a directory.
+	for len(dir) > 0 && os.IsPathSeparator(dir[len(dir)-1]) {
+		dir = dir[:len(dir)-1]
+	}
+	parent, name := filepath.Split(dir)
+	if name == "" || name == ".." {
+		return "", err
+	}
 	// A dangling symlink is not a directory that Create can make.
 	if _, statErr := os.Lstat(dir); statErr == nil {
 		return "", err
 	} else if !errors.Is(statErr, fs.ErrNotExist) {
 		return "", statErr
 	}
-	parent := filepath.Dir(dir)
-	if parent == dir {
-		return "", err
+	if parent == "" {
+		parent = "."
 	}
 	real, err = resolveParent(parent)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(real, filepath.Base(dir)), nil
+	return filepath.Join(real, name), nil
 }
 
 // DeleteIfUnchanged removes the file stored under key when it still matches
