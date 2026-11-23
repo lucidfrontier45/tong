@@ -1652,25 +1652,36 @@ func (e *beforeWriteEndpoint) Create(ctx context.Context, key string, modTime ti
 
 func TestMovePruneProtectsSkippedNestedSource(t *testing.T) {
 	t.Parallel()
-	dst := t.TempDir()
-	src := filepath.Join(dst, "inbox")
-	file := filepath.Join(src, "file")
-	writeFile(t, file, "only copy")
-	extra := filepath.Join(dst, "extra")
-	writeFile(t, extra, "prune me")
-	var stderr bytes.Buffer
-	code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, resolveDest(t, dst+"/"),
-		Options{Recursive: true, Existing: true, RemoveSourceFiles: true, Delete: true}, io.Discard, &stderr)
-	if code != CodeOK {
-		t.Fatalf("exit %d: %s", code, stderr.String())
-	}
-	if got := readFile(t, file); got != "only copy" {
-		t.Fatalf("source holds %q", got)
-	}
-	for _, absent := range []string{extra, filepath.Join(dst, "file")} {
-		if _, err := os.Stat(absent); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("stat %s: %v; want absent", absent, err)
-		}
+	for _, name := range []string{"direct", "symlink"} {
+		t.Run(name, func(t *testing.T) {
+			dst := t.TempDir()
+			src := filepath.Join(dst, "inbox")
+			file := filepath.Join(src, "file")
+			writeFile(t, file, "only copy")
+			extra := filepath.Join(dst, "extra")
+			writeFile(t, extra, "prune me")
+			if name == "symlink" {
+				link := filepath.Join(t.TempDir(), "input")
+				if err := os.Symlink(src, link); err != nil {
+					t.Skipf("cannot create directory symlink: %v", err)
+				}
+				src = link
+			}
+			var stderr bytes.Buffer
+			code := Run(t.Context(), []storage.Resolved{resolveSource(t, src+"/")}, resolveDest(t, dst+"/"),
+				Options{Recursive: true, Existing: true, RemoveSourceFiles: true, Delete: true}, io.Discard, &stderr)
+			if code != CodeOK {
+				t.Fatalf("exit %d: %s", code, stderr.String())
+			}
+			if got := readFile(t, file); got != "only copy" {
+				t.Fatalf("source holds %q", got)
+			}
+			for _, absent := range []string{extra, filepath.Join(dst, "file")} {
+				if _, err := os.Stat(absent); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("stat %s: %v; want absent", absent, err)
+				}
+			}
+		})
 	}
 }
 

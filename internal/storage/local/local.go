@@ -128,16 +128,17 @@ func fileDest(loc storage.Location) (storage.Resolved, error) {
 // the same way from any working directory and so that two endpoints can be
 // compared by path.
 func newEndpoint(dir string) (*endpoint, error) {
-	// Cleaning a path with ".." before resolving symlinks can select a
-	// different directory than the OS did when it statted the input.
-	if hasParentComponent(dir) {
-		resolved, err := resolveParent(dir)
-		if err != nil {
-			return nil, err
-		}
-		dir = resolved
+	if dir == "" {
+		dir = "."
 	}
-	root, err := filepath.Abs(dir)
+	// WalkDir does not descend into a symlink at its starting path. Resolve
+	// the selected root before cleaning "..", but leave links encountered
+	// inside the tree alone. A destination root need not exist yet.
+	resolved, err := resolveParent(dir)
+	if err != nil {
+		return nil, err
+	}
+	root, err := filepath.Abs(resolved)
 	if err != nil {
 		return nil, err
 	}
