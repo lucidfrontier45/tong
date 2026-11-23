@@ -64,3 +64,35 @@ func TestDriverKeepsTheNamespacesApart(t *testing.T) {
 		t.Errorf("the listing is %v, want [a.txt]", keys)
 	}
 }
+
+func TestDriverListsTheInformationBelowANamespace(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	modTime := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	driver.Put("src", "a.txt", []byte("hello"), modTime)
+
+	src, err := driver.ResolveSource(context.Background(), storage.Location{
+		Scheme:   storage.SchemeFile,
+		Path:     "src/",
+		Trailing: true,
+	})
+	if err != nil {
+		t.Fatalf("ResolveSource() = %v", err)
+	}
+
+	if err := src.Endpoint.List(context.Background(), "", func(info storage.FileInfo) error {
+		if info.Key != "a.txt" {
+			t.Errorf("key = %q, want %q", info.Key, "a.txt")
+		}
+		if info.Size != 5 {
+			t.Errorf("size = %d, want 5", info.Size)
+		}
+		if !info.ModTime.Equal(modTime) {
+			t.Errorf("modification time = %v, want %v", info.ModTime, modTime)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("List() = %v", err)
+	}
+}

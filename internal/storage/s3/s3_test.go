@@ -143,3 +143,92 @@ func TestIntegration(t *testing.T) {
 		t.Errorf("Open() = %v, want %v", err, storage.ErrNotFound)
 	}
 }
+
+// TestIntegrationMultipart uploads an object that is larger than a part, so
+// that the multipart path of the driver runs. It is skipped unless
+// TONG_TEST_S3_ENDPOINT points at a service.
+func TestIntegrationMultipart(t *testing.T) {
+	endpoint := os.Getenv("TONG_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set TONG_TEST_S3_ENDPOINT to run the S3 integration tests")
+	}
+
+	region := os.Getenv("TONG_TEST_S3_REGION")
+	if region == "" {
+		region = "us-east-1"
+	}
+	bucket := os.Getenv("TONG_TEST_S3_BUCKET")
+	if bucket == "" {
+		bucket = "tong-test"
+	}
+
+	ctx := context.Background()
+	driver := s3.New(s3.Options{
+		Region:   region,
+		Endpoint: endpoint,
+		// 5 MiB is the smallest part S3 allows, so that a 6 MiB object is
+		// uploaded in two parts with the smallest possible payload.
+		PartSize:          5 << 20,
+		UploadConcurrency: 2,
+	})
+
+	createBucket(t, ctx, region, endpoint, bucket)
+
+	prefix := "tong/" + strings.ReplaceAll(t.Name(), "/", "-") + "/"
+	dest, err := driver.ResolveDest(ctx, storage.Location{
+		Scheme: storage.SchemeS3,
+		Bucket: bucket,
+		Key:    prefix,
+	}, false)
+	if err != nil {
+		t.Fatalf("ResolveDest() = %v", err)
+	}
+
+	modTime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	content := bytes.Repeat([]byte("0123456789abcdef"), 6<<20/16)
+
+	// The engine tells the driver how large the file is, which is what lets
+	// the transfer manager plan the parts of the upload.
+	sized, ok := dest.Endpoint.(storage.SizedCreator)
+	if !ok {
+		t.Fatal("the S3 endpoint does not accept the size of a file")
+	}
+	if err := sized.CreateSized(ctx, "big.bin", modTime, int64(len(content)), bytes.NewReader(content)); err != nil {
+		t.Fatalf("CreateSized() = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := dest.Endpoint.Delete(ctx, "big.bin"); err != nil {
+			t.Logf("cannot clean up: %v", err)
+		}
+	})
+
+	if err := dest.Endpoint.List(ctx, "", func(info storage.FileInfo) error {
+		if info.Key != "big.bin" {
+			return nil
+		}
+		if info.Size != int64(len(content)) {
+			t.Errorf("size = %d, want %d", info.Size, len(content))
+		}
+		if !info.ModTime.Truncate(time.Second).Equal(modTime) {
+			t.Errorf("modification time = %v, want %v", info.ModTime, modTime)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("List() = %v", err)
+	}
+
+	reader, err := dest.Endpoint.Open(ctx, "big.bin")
+	if err != nil {
+		t.Fatalf("Open() = %v", err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("cannot read the object: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("cannot close the object: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("the object holds %d bytes, want the %d bytes that were written", len(got), len(content))
+	}
+}

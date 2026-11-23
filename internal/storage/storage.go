@@ -86,6 +86,20 @@ type ShallowLister interface {
 	ListShallow(ctx context.Context, prefix string, fn func(FileInfo) error) error
 }
 
+// SizedCreator is an optional capability: the backend learns how large the
+// file it is asked to write is.
+//
+// A backend that splits an upload into parts uses the size to decide whether
+// the file fits into a single request and how large the parts have to be,
+// instead of buffering the stream to find out.
+type SizedCreator interface {
+	// CreateSized is [Endpoint.Create] with the size of the file in bytes.
+	// The size comes from the listing of the source, so a file that changed
+	// in between still transfers the bytes it holds, but the backend may
+	// rely on the size and report a mismatch as an error.
+	CreateSized(ctx context.Context, key string, modTime time.Time, size int64, r io.Reader) error
+}
+
 // ModTimeAware is an optional capability: the backend reports the
 // modification time of the files it lists, and lets the caller say whether
 // those times are needed.

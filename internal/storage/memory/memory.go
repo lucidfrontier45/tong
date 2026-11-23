@@ -138,26 +138,29 @@ func (e *endpoint) List(ctx context.Context, prefix string, fn func(storage.File
 	maps.Copy(files, e.driver.files)
 	e.driver.mu.Unlock()
 
-	var keys []string
-	for key := range files {
-		rel, ok := relative(e.root, key)
-		if !ok {
-			continue
+	// The files are sorted by their full key, which keeps the relative
+	// keys of a namespace in order too.
+	fulls := make([]string, 0, len(files))
+	for full := range files {
+		if _, ok := relative(e.root, full); ok {
+			fulls = append(fulls, full)
 		}
-		keys = append(keys, rel)
 	}
-	sort.Strings(keys)
+	sort.Strings(fulls)
 
-	for _, key := range keys {
+	for _, full := range fulls {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rel := key
-		if !strings.HasPrefix(rel, prefix) {
+		key, ok := relative(e.root, full)
+		if !ok || !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		info := files[key].info
-		info.Key = rel
+		// The information of the file is looked up by its full key, so
+		// that the size and the modification time are not lost below the
+		// root namespace.
+		info := files[full].info
+		info.Key = key
 		if err := fn(info); err != nil {
 			return err
 		}

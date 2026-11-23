@@ -11,14 +11,14 @@ If you know `rsync`, you already know `tong`:
     tong -a --delete ./dist/ s3://example-bucket/dist/
 
 > [!WARNING]
-> tong is under active development. The v0.1 CLI surface is implemented, but
-> the flags that are marked as planned below are rejected with a usage error
-> until they land.
+> tong is under active development. The v0.2 CLI surface is implemented, but
+> `-z`, `-c` and `-P` are still rejected with a usage error until they
+> land.
 
 ## Supported storage
 
-tong is in early development, so nothing is checked off yet. Boxes are ticked
-as support lands; v0.1 targets local ⇄ Amazon S3.
+Boxes are ticked as support lands. Local filesystems and Amazon S3 (and the
+services that speak its API) are the backends of v0.2.
 
 - [x] Local filesystem — `/path`
 - [x] Amazon S3 — `s3://bucket/key`
@@ -61,10 +61,16 @@ file:
   `--exclude-from`).
 - Size and time constraints (`--max-size`, `--min-size`, `--update`,
   `--existing`, `--ignore-existing`).
-- Planned for v0.2 and later: parallel, resumable multipart uploads with
-  bandwidth limiting (`--bwlimit`), server-side copy when syncing bucket →
-  bucket, progress reporting with `-P`, machine-readable `--stats` output
-  and checksum comparison with `-c`.
+- Parallel transfers (`--parallel`, four files at a time by default) and
+  multipart uploads, so objects beyond the 5 GB single-request limit go up
+  in parts.
+- One shared bandwidth budget for the whole run (`--bwlimit`), covering every
+  worker and both directions.
+- One-way moves with `--remove-source-files`.
+- Machine-readable summaries with `--stats`.
+- Still planned for later releases: progress reporting with `-P`, resumable
+  uploads, compression with `-z`, server-side copy when syncing bucket →
+  bucket, and checksum comparison with `-c`.
 
 ## Installation
 
@@ -144,10 +150,11 @@ argument is a source. Sources and destinations are URLs:
 | `--exclude-from FILE` | Read exclude patterns from a file                    |
 | `--max-size SIZE`   | Don't transfer files larger than SIZE                  |
 | `--min-size SIZE`   | Don't transfer files smaller than SIZE                 |
+| `--parallel N`      | Transfer up to N files at a time (default 4; a tong extension, rsync transfers a single stream) |
 | `--bwlimit KBPS`    | Limit I/O bandwidth, KiB/s                             |
 | `-P`                | Same as `--partial --progress`                         |
-| `--stats`           | Print a transfer summary                               |
-| `--remove-source-files` | Delete source files after a successful transfer (one-way move) |
+| `--stats`           | Print a transfer summary as `key=value` lines          |
+| `--remove-source-files` | Delete source files that are in sync with the destination (one-way move) |
 | `--s3-endpoint URL` | Use a custom S3-compatible endpoint                    |
 | `--s3-region REGION`| Override the AWS region                                |
 | `-h, --help`        | Show help                                              |
@@ -186,6 +193,40 @@ daemon mode. tong exits with an error if it is given options it cannot honor.
 - **Modification times are preserved through object metadata.** tong stores
   the modification time of a file in the `x-amz-meta-mtime` metadata of the
   object, with the one second resolution that object storage offers.
+- **Multipart uploads are planned from the listing.** A file larger than
+  16 MiB goes up in parts of at least 16 MiB, as many at a time as
+  `--parallel` allows, and the size tong knows from the listing lets the part
+  size grow, so a single object may be as large as S3 allows. An upload that
+  fails aborts its parts instead of leaving them in the bucket.
+- **`--bwlimit` is one budget for the whole run.** The number is in KiB per
+  second, with an optional `K`, `M` or `G` suffix, and `0` means no limit,
+  the way rsync counts it. Unlike rsync, the budget is shared by every worker
+  and by the parts of a multipart upload, so `--parallel 8 --bwlimit 1M` still
+  moves about 1 MiB/s in total. Throttling happens on the source, so it holds
+  for local → S3, S3 → local and S3 → S3 alike.
+- **`--remove-source-files` removes what is in sync, not only what was
+  copied.** A source file that the destination already holds is removed as
+  well, because it is in sync either way. Files that `--ignore-existing`,
+  `--update` or a filter leaves out stay where they are, directories are
+  never removed, and nothing is removed during a `--dry-run` or when the
+  transfer fails.
+- **`--stats` prints `key=value` lines, not rsync's summary block.** The
+  keys are stable, so a script can read them with `grep` or `awk`:
+
+      files_total=42
+      files_transferred=40
+      files_skipped=2
+      files_deleted=1
+      files_removed=40
+      bytes_transferred=1234
+      errors=0
+
+  `files_total` counts the files in the transfer list, `files_skipped` the
+  ones that were already in sync, `files_deleted` the extraneous destination
+  files that `--delete` removed and `files_removed` the source files that
+  `--remove-source-files` removed. The summary is printed for a dry run and
+  for a run that failed partway through as well.
+
 - **`-u` compares the preserved modification times.** The time an object
   was uploaded is not the modification time of the file, so `--update` looks
   at the preserved times, the same way `--times` does. Otherwise a file that
@@ -222,7 +263,7 @@ shell history — and have them just work against a bucket.
 ## Roadmap
 
 - [x] v0.1 — local ⇄ S3: core flags, `--dry-run`, `--delete`, filters, exit codes
-- [ ] v0.2 — `--stats`, `--bwlimit`, parallel uploads, `--remove-source-files`
+- [x] v0.2 — parallel transfers (`--parallel`), multipart uploads beyond 5 GB, `--bwlimit`, `--remove-source-files`, `--stats`
 - [ ] v0.3 — Google Cloud Storage and Azure Blob Storage
 - [ ] v0.4 — cloud ⇄ cloud server-side copy, S3-compatible endpoints
 - [ ] v0.5 — checksum-based comparison (`-c`) using provider checksum APIs

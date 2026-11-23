@@ -13,9 +13,12 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lucidfrontier45/tong/internal/filter"
+	"github.com/lucidfrontier45/tong/internal/ratelimit"
 	"github.com/lucidfrontier45/tong/internal/storage"
 )
 
@@ -62,7 +65,31 @@ type Options struct {
 	MinSize int64
 	// Rules are the ordered include and exclude rules.
 	Rules []filter.Rule
+	// Parallel is the number of files that are transferred at the same
+	// time. Zero or a negative value transfers one file at a time.
+	Parallel int
+	// BWLimit is the bandwidth budget of the run in bytes per second,
+	// shared by every transfer. Zero means no limit.
+	BWLimit int64
+	// Stats prints a summary of the run at the end.
+	Stats bool
+	// RemoveSourceFiles deletes the source files that are in sync with
+	// the destination, which turns the run into a one-way move.
+	RemoveSourceFiles bool
 }
+
+// decision is what comparing a source file with its destination decides.
+type decision int
+
+const (
+	// decisionTransfer means that the file has to be copied.
+	decisionTransfer decision = iota
+	// decisionInSync means that the destination already holds the file.
+	decisionInSync
+	// decisionExcluded means that the file is not part of the transfer
+	// list, because an option such as --existing left it out.
+	decisionExcluded
+)
 
 // item is a single file that has to be transferred.
 type item struct {
@@ -86,6 +113,44 @@ type plan struct {
 	planned map[string]bool
 	// items holds the files that have to be transferred.
 	items []item
+	// removals holds the source files that are already in sync and that
+	// --remove-source-files therefore deletes without a transfer.
+	removals []removal
+	// limiter is the bandwidth budget shared by every transfer, or nil
+	// when the run is not limited.
+	limiter *ratelimit.Limiter
+	// stats counts what the run did.
+	stats stats
+	// printMu serialises the lines that the workers write.
+	printMu sync.Mutex
+}
+
+// removal is a source file that is already in sync with the destination.
+type removal struct {
+	src     storage.Endpoint
+	key     string
+	display string
+}
+
+// stats counts what a run did. The counters are updated from the workers,
+// so they are atomic.
+type stats struct {
+	// total is the number of files in the transfer list.
+	total atomic.Int64
+	// transferred is the number of files that were copied.
+	transferred atomic.Int64
+	// skipped is the number of files that were already in sync.
+	skipped atomic.Int64
+	// deleted is the number of extraneous destination files that were
+	// deleted.
+	deleted atomic.Int64
+	// removed is the number of source files that --remove-source-files
+	// deleted.
+	removed atomic.Int64
+	// bytes is the number of bytes that were copied.
+	bytes atomic.Int64
+	// errors is the number of operations that failed.
+	errors atomic.Int64
 }
 
 // Run synchronises the sources into the destination and returns the exit
@@ -118,6 +183,7 @@ func Run(ctx context.Context, sources []storage.Resolved, dest storage.Resolved,
 		dest:      dest,
 		destFiles: destFiles,
 		planned:   make(map[string]bool),
+		limiter:   ratelimit.New(opts.BWLimit, nil),
 	}
 
 	for _, src := range sources {
@@ -197,16 +263,28 @@ func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo)
 	p.planned[destKey] = true
 
 	dst, exists := p.destFiles[destKey]
-	if !needsTransfer(info, dst, exists, p.opts) {
+	switch compare(info, dst, exists, p.opts) {
+	case decisionExcluded:
+		// The file is not part of the transfer list.
 		return
+	case decisionInSync:
+		// The destination already holds the file. rsync removes such a
+		// source too, so the file is in sync either way.
+		p.stats.total.Add(1)
+		p.stats.skipped.Add(1)
+		if p.opts.RemoveSourceFiles {
+			p.removals = append(p.removals, removal{
+				src:     src.Endpoint,
+				key:     key,
+				display: srcDisplay(src, key),
+			})
+		}
+		return
+	case decisionTransfer:
+		p.stats.total.Add(1)
 	}
 
-	srcDisplay := display(src.Display, key)
-	if !src.IsDir {
-		// The source is a single file, so it already is its own path.
-		srcDisplay = src.Display
-	}
-
+	srcDisplay := srcDisplay(src, key)
 	p.items = append(p.items, item{
 		src:        src.Endpoint,
 		srcKey:     key,
@@ -214,6 +292,15 @@ func (p *plan) consider(src storage.Resolved, key string, info storage.FileInfo)
 		destKey:    destKey,
 		info:       info,
 	})
+}
+
+// srcDisplay renders the path of a source file for output.
+func srcDisplay(src storage.Resolved, key string) string {
+	if !src.IsDir {
+		// The source is a single file, so it already is its own path.
+		return src.Display
+	}
+	return display(src.Display, key)
 }
 
 // destKey maps a source key to its key in the destination.
@@ -236,44 +323,32 @@ func (p *plan) destPath(key string) string {
 
 // execute copies the planned files and removes the extraneous ones.
 func (p *plan) execute(ctx context.Context, stdout, stderr io.Writer) int {
+	if p.opts.DryRun {
+		p.preview(stdout)
+		p.report(stdout)
+		return CodeOK
+	}
+
 	failed, vanished := 0, 0
-
-	for _, it := range p.items {
-		srcPath := it.srcDisplay
-		destPath := p.destPath(it.destKey)
-		if p.opts.DryRun {
-			_, _ = fmt.Fprintf(stdout, "would copy %s -> %s\n", srcPath, destPath)
-			continue
-		}
-		if err := p.copyFile(ctx, it); err != nil {
-			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, storage.ErrNotFound) {
-				vanished++
-			} else {
-				failed++
-			}
-			_, _ = fmt.Fprintf(stderr, "tong: %v\n", err)
-			continue
-		}
-		if p.opts.Verbosity > 0 {
-			_, _ = fmt.Fprintln(stdout, destPath)
-		}
-	}
-
-	for _, key := range p.deletions() {
-		destPath := p.destPath(key)
-		if p.opts.DryRun {
-			_, _ = fmt.Fprintf(stdout, "would delete %s\n", destPath)
-			continue
-		}
-		if err := p.dest.Endpoint.Delete(ctx, key); err != nil {
+	for _, err := range p.transferAll(ctx, stdout, stderr) {
+		switch {
+		case err == nil:
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, storage.ErrNotFound):
+			vanished++
+		default:
 			failed++
-			_, _ = fmt.Fprintf(stderr, "tong: %v\n", err)
-			continue
-		}
-		if p.opts.Verbosity > 0 {
-			_, _ = fmt.Fprintf(stdout, "deleting %s\n", destPath)
 		}
 	}
+
+	// A file that is already in sync is removed as well, because
+	// --remove-source-files turns the transfer list into a move.
+	failed += p.removeSynced(ctx, stderr)
+
+	// The extraneous files of the destination are deleted after the
+	// transfers, the way rsync does it.
+	failed += p.deleteExtraneous(ctx, stdout, stderr)
+
+	p.report(stdout)
 
 	switch {
 	case failed > 0:
@@ -283,6 +358,152 @@ func (p *plan) execute(ctx context.Context, stdout, stderr io.Writer) int {
 	default:
 		return CodeOK
 	}
+}
+
+// transferAll copies the planned files with a bounded number of workers and
+// returns the error of every file, in the order of the plan.
+func (p *plan) transferAll(ctx context.Context, stdout, stderr io.Writer) []error {
+	errs := make([]error, len(p.items))
+	if len(p.items) == 0 {
+		return errs
+	}
+
+	// A fixed number of workers reads from the jobs channel, which keeps
+	// at most Parallel transfers in flight. The workers write their own
+	// result, so the slice needs no lock.
+	jobs := make(chan int)
+	workers := min(max(p.opts.Parallel, 1), len(p.items))
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				errs[i] = p.transfer(ctx, p.items[i], stdout, stderr)
+			}
+		})
+	}
+	for i := range p.items {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	return errs
+}
+
+// transfer copies one file, removes its source when the run asks for it and
+// prints the result, which is what interleaves the output of the workers
+// the way rsync interleaves its own.
+func (p *plan) transfer(ctx context.Context, it item, stdout, stderr io.Writer) error {
+	bytesRead, err := p.copyFile(ctx, it)
+	if err != nil {
+		p.stats.errors.Add(1)
+		p.print(stderr, "tong: %v\n", err)
+		return err
+	}
+	p.stats.transferred.Add(1)
+	p.stats.bytes.Add(bytesRead)
+
+	if p.opts.RemoveSourceFiles {
+		if err := it.src.Delete(ctx, it.srcKey); err != nil {
+			p.stats.errors.Add(1)
+			p.print(stderr, "tong: %v\n", err)
+			return err
+		}
+		p.stats.removed.Add(1)
+	}
+
+	if p.opts.Verbosity > 0 {
+		p.print(stdout, "%s\n", p.destPath(it.destKey))
+	}
+	return nil
+}
+
+// removeSynced deletes the source files that are already in sync with the
+// destination and returns the number of removals that failed.
+func (p *plan) removeSynced(ctx context.Context, stderr io.Writer) int {
+	failed := 0
+	for _, r := range p.removals {
+		if err := r.src.Delete(ctx, r.key); err != nil {
+			failed++
+			p.stats.errors.Add(1)
+			p.print(stderr, "tong: %v\n", err)
+			continue
+		}
+		p.stats.removed.Add(1)
+	}
+	return failed
+}
+
+// deleteExtraneous deletes the destination files that the sources do not
+// provide and returns the number of deletions that failed.
+func (p *plan) deleteExtraneous(ctx context.Context, stdout, stderr io.Writer) int {
+	failed := 0
+	for _, key := range p.deletions() {
+		if err := p.dest.Endpoint.Delete(ctx, key); err != nil {
+			failed++
+			p.stats.errors.Add(1)
+			p.print(stderr, "tong: %v\n", err)
+			continue
+		}
+		p.stats.deleted.Add(1)
+		if p.opts.Verbosity > 0 {
+			p.print(stdout, "deleting %s\n", p.destPath(key))
+		}
+	}
+	return failed
+}
+
+// preview prints what the run would do, without changing anything.
+func (p *plan) preview(stdout io.Writer) {
+	for _, it := range p.items {
+		p.print(stdout, "would copy %s -> %s\n", it.srcDisplay, p.destPath(it.destKey))
+	}
+	for _, key := range p.deletions() {
+		p.print(stdout, "would delete %s\n", p.destPath(key))
+	}
+	if !p.opts.RemoveSourceFiles {
+		return
+	}
+	for _, it := range p.items {
+		p.print(stdout, "would remove %s\n", it.srcDisplay)
+	}
+	for _, r := range p.removals {
+		p.print(stdout, "would remove %s\n", r.display)
+	}
+}
+
+// report prints the summary of the run. The keys are fixed and stable, so
+// that they can be read with a grep or an awk.
+func (p *plan) report(stdout io.Writer) {
+	if !p.opts.Stats {
+		return
+	}
+	p.print(stdout,
+		"files_total=%d\n"+
+			"files_transferred=%d\n"+
+			"files_skipped=%d\n"+
+			"files_deleted=%d\n"+
+			"files_removed=%d\n"+
+			"bytes_transferred=%d\n"+
+			"errors=%d\n",
+		p.stats.total.Load(),
+		p.stats.transferred.Load(),
+		p.stats.skipped.Load(),
+		p.stats.deleted.Load(),
+		p.stats.removed.Load(),
+		p.stats.bytes.Load(),
+		p.stats.errors.Load(),
+	)
+}
+
+// print writes a line of output, which serialises the workers so that their
+// lines do not interleave.
+func (p *plan) print(w io.Writer, format string, args ...any) {
+	p.printMu.Lock()
+	defer p.printMu.Unlock()
+
+	_, _ = fmt.Fprintf(w, format, args...)
 }
 
 // deletions returns the destination keys that the sources do not provide.
@@ -313,19 +534,53 @@ func (p *plan) deletions() []string {
 	return keys
 }
 
-// copyFile copies a single file from a source to the destination.
-func (p *plan) copyFile(ctx context.Context, it item) error {
+// copyFile copies a single file from a source to the destination and
+// returns the number of bytes that were read.
+func (p *plan) copyFile(ctx context.Context, it item) (int64, error) {
 	reader, err := it.src.Open(ctx, it.srcKey)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = reader.Close() }()
+
+	// One limiter throttles every transfer, so that --bwlimit is a global
+	// budget instead of one budget per file, and so that the backpressure
+	// reaches the source.
+	var source io.Reader = reader
+	if p.limiter != nil {
+		source = p.limiter.Reader(source)
+	}
+	counted := &countingReader{r: source}
 
 	modTime := time.Time{}
 	if p.opts.Times {
 		modTime = it.info.ModTime
 	}
-	return p.dest.Endpoint.Create(ctx, it.destKey, modTime, reader)
+
+	// A backend that can use the size of the file plans a multipart
+	// transfer with it instead of buffering the stream.
+	if sized, ok := p.dest.Endpoint.(storage.SizedCreator); ok {
+		err = sized.CreateSized(ctx, it.destKey, modTime, it.info.Size, counted)
+	} else {
+		err = p.dest.Endpoint.Create(ctx, it.destKey, modTime, counted)
+	}
+	if err != nil {
+		return counted.n, err
+	}
+	return counted.n, nil
+}
+
+// countingReader counts the bytes that pass through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+// Read reads from the underlying reader and counts the bytes.
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // listDest lists the files the destination currently holds.
@@ -369,26 +624,33 @@ func lookup(ctx context.Context, endpoint storage.Endpoint, key string) (storage
 	return found, nil
 }
 
-// needsTransfer reports whether a source file has to be copied to the
-// destination.
-func needsTransfer(src, dst storage.FileInfo, exists bool, opts Options) bool {
+// compare decides what happens to a source file: it may have to be copied,
+// it may already be in sync, or an option may leave it out of the transfer
+// list entirely.
+func compare(src, dst storage.FileInfo, exists bool, opts Options) decision {
 	switch {
 	case !exists:
 		// The destination does not have the file yet.
-		return !opts.Existing
+		if opts.Existing {
+			return decisionExcluded
+		}
+		return decisionTransfer
 	case opts.IgnoreExisting:
-		return false
+		return decisionExcluded
 	case opts.Update && dst.ModTime.After(src.ModTime):
 		// The destination has a newer copy.
-		return false
+		return decisionExcluded
 	case src.Size != dst.Size:
-		return true
+		return decisionTransfer
 	case opts.SizeOnly:
-		return false
+		return decisionInSync
 	case opts.Times:
-		return !sameTime(src.ModTime, dst.ModTime)
+		if sameTime(src.ModTime, dst.ModTime) {
+			return decisionInSync
+		}
+		return decisionTransfer
 	default:
-		return false
+		return decisionInSync
 	}
 }
 

@@ -40,8 +40,9 @@ type options struct {
 	MinSize        string   `kong:"name='min-size',help='Do not transfer files smaller than SIZE',placeholder='SIZE'"`
 	BWLimit        string   `kong:"name='bwlimit',help='Limit I/O bandwidth, KiB/s',placeholder='KBPS'"`
 	Partial        bool     `kong:"short='P',help='Same as --partial --progress'"`
-	Stats          bool     `kong:"help='Print a transfer summary'"`
-	RemoveSource   bool     `kong:"name='remove-source-files',help='Delete source files after a successful transfer'"`
+	Stats          bool     `kong:"help='Print a transfer summary as key=value lines'"`
+	RemoveSource   bool     `kong:"name='remove-source-files',help='Delete source files that are in sync with the destination'"`
+	Parallel       int      `kong:"name='parallel',default='4',help='Transfer this many files at the same time',placeholder='N'"`
 	S3Endpoint     string   `kong:"name='s3-endpoint',help='Use a custom S3-compatible endpoint'"`
 	S3Region       string   `kong:"name='s3-region',help='Override the AWS region'"`
 	Srcs           []string `kong:"arg='true',name='src',optional='true',help='Source and destination paths'"`
@@ -96,6 +97,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "tong: --delete does not work without --recursive (-r) or --archive (-a)")
 		return syncengine.CodeUsage
 	}
+	if opts.Parallel < 1 {
+		_, _ = fmt.Fprintln(stderr, "tong: --parallel must be at least 1")
+		return syncengine.CodeUsage
+	}
 
 	rules, err := filterRules(args)
 	if err != nil {
@@ -113,12 +118,20 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "tong: --min-size: %v\n", err)
 		return syncengine.CodeUsage
 	}
+	bwLimit, err := parseBWLimit(opts.BWLimit)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "tong: --bwlimit: %v\n", err)
+		return syncengine.CodeUsage
+	}
 
 	registry := storage.NewRegistry()
 	registry.Register(storage.SchemeFile, local.New())
 	registry.Register(storage.SchemeS3, s3.New(s3.Options{
 		Region:   opts.S3Region,
 		Endpoint: opts.S3Endpoint,
+		// A single --parallel knob drives both the files of the run and
+		// the parts of a multipart upload.
+		UploadConcurrency: opts.Parallel,
 	}))
 
 	sources := make([]storage.Resolved, 0, len(opts.Srcs)-1)
@@ -142,18 +155,22 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	return syncengine.Run(ctx, sources, dest, syncengine.Options{
-		Recursive:      recursive,
-		Times:          opts.Times || opts.Archive,
-		SizeOnly:       opts.SizeOnly,
-		Update:         opts.Update,
-		Existing:       opts.Existing,
-		IgnoreExisting: opts.IgnoreExisting,
-		Delete:         opts.Delete,
-		DryRun:         opts.DryRun,
-		Verbosity:      opts.Verbose,
-		MaxSize:        maxSize,
-		MinSize:        minSize,
-		Rules:          rules,
+		Recursive:         recursive,
+		Times:             opts.Times || opts.Archive,
+		SizeOnly:          opts.SizeOnly,
+		Update:            opts.Update,
+		Existing:          opts.Existing,
+		IgnoreExisting:    opts.IgnoreExisting,
+		Delete:            opts.Delete,
+		DryRun:            opts.DryRun,
+		Verbosity:         opts.Verbose,
+		MaxSize:           maxSize,
+		MinSize:           minSize,
+		Rules:             rules,
+		Parallel:          opts.Parallel,
+		BWLimit:           bwLimit,
+		Stats:             opts.Stats,
+		RemoveSourceFiles: opts.RemoveSource,
 	}, stdout, stderr)
 }
 
@@ -168,15 +185,6 @@ func (o *options) unsupported() []string {
 	}
 	if o.Partial {
 		out = append(out, "-P")
-	}
-	if o.Stats {
-		out = append(out, "--stats")
-	}
-	if o.BWLimit != "" {
-		out = append(out, "--bwlimit")
-	}
-	if o.RemoveSource {
-		out = append(out, "--remove-source-files")
 	}
 	return out
 }
@@ -239,4 +247,17 @@ func parseSize(value string) (int64, error) {
 	}
 
 	return size, nil
+}
+
+// parseBWLimit parses --bwlimit, which rsync writes in KiB per second with
+// an optional K, M or G suffix. Zero means no limit.
+func parseBWLimit(value string) (int64, error) {
+	kib, err := parseSize(value)
+	if err != nil {
+		return 0, err
+	}
+	if kib > math.MaxInt64/1024 {
+		return 0, fmt.Errorf("size %q is too large", value)
+	}
+	return kib * 1024, nil
 }

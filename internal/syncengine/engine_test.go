@@ -499,6 +499,363 @@ func TestRunWithTheMemoryDriver(t *testing.T) {
 	}
 }
 
+func TestRunTransfersInParallel(t *testing.T) {
+	t.Parallel()
+
+	const files = 40
+
+	driver := memory.New()
+	for i := range files {
+		key := fmt.Sprintf("file-%02d.txt", i)
+		driver.Put("src", key, []byte(strings.Repeat("x", 1024+i)), time.Now())
+	}
+
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		memoryDest(t, driver, "dst"),
+		Options{Recursive: true, Parallel: 8},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+
+	keys := driver.Keys("dst")
+	if len(keys) != files {
+		t.Fatalf("the destination holds %d files, want %d", len(keys), files)
+	}
+	for i := range files {
+		key := fmt.Sprintf("file-%02d.txt", i)
+		got, ok := driver.Get("dst", key)
+		if !ok {
+			t.Errorf("%s was not copied", key)
+			continue
+		}
+		if want := strings.Repeat("x", 1024+i); string(got) != want {
+			t.Errorf("%s holds %d bytes, want %d", key, len(got), len(want))
+		}
+	}
+}
+
+func TestRunRemoveSourceFiles(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// source is the content of the source file.
+		source string
+		// dest is the content of the destination file. An empty string
+		// means that the destination does not hold the file.
+		dest string
+		// destTime is the modification time of the destination file.
+		destTime time.Time
+		opts     Options
+		// wantSource is what is left of the source file.
+		wantSource string
+		// wantDest is what the destination holds.
+		wantDest string
+		wantCode int
+	}{
+		{
+			name:       "a transferred file is removed",
+			source:     "hello",
+			dest:       "",
+			wantSource: "",
+			wantDest:   "hello",
+			wantCode:   CodeOK,
+		},
+		{
+			name:       "a file that is already in sync is removed",
+			source:     "hello",
+			dest:       "hello",
+			wantSource: "",
+			wantDest:   "hello",
+			wantCode:   CodeOK,
+		},
+		{
+			name:       "--existing keeps a file that the destination does not have",
+			source:     "hello",
+			opts:       Options{Existing: true},
+			wantSource: "hello",
+			wantDest:   "",
+			wantCode:   CodeOK,
+		},
+		{
+			name:       "--ignore-existing keeps a file that the destination has",
+			source:     "hello",
+			dest:       "hello",
+			opts:       Options{IgnoreExisting: true},
+			wantSource: "hello",
+			wantDest:   "hello",
+			wantCode:   CodeOK,
+		},
+		{
+			name:       "--update keeps a file that is newer on the destination",
+			source:     "hello",
+			dest:       "world",
+			destTime:   time.Now(),
+			opts:       Options{Update: true},
+			wantSource: "hello",
+			wantDest:   "world",
+			wantCode:   CodeOK,
+		},
+		{
+			name:       "a dry run removes nothing",
+			source:     "hello",
+			opts:       Options{DryRun: true},
+			wantSource: "hello",
+			wantDest:   "",
+			wantCode:   CodeOK,
+		},
+		{
+			name:       "a filtered file is not removed",
+			source:     "hello",
+			opts:       Options{Rules: []filter.Rule{{Kind: filter.Exclude, Pattern: "*.txt"}}},
+			wantSource: "hello",
+			wantDest:   "",
+			wantCode:   CodeOK,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			driver := memory.New()
+			driver.Put("src", "a.txt", []byte(tc.source), time.Now().Add(-time.Hour))
+			if tc.dest != "" {
+				driver.Put("dst", "a.txt", []byte(tc.dest), tc.destTime)
+			}
+
+			opts := tc.opts
+			opts.Recursive = true
+			opts.RemoveSourceFiles = true
+
+			code := Run(t.Context(),
+				[]storage.Resolved{memorySource(t, driver, "src/")},
+				memoryDest(t, driver, "dst"),
+				opts,
+				io.Discard, io.Discard,
+			)
+			if code != tc.wantCode {
+				t.Errorf("Run() = %d, want %d", code, tc.wantCode)
+			}
+
+			got, _ := driver.Get("src", "a.txt")
+			if string(got) != tc.wantSource {
+				t.Errorf("the source holds %q, want %q", got, tc.wantSource)
+			}
+			got, _ = driver.Get("dst", "a.txt")
+			if string(got) != tc.wantDest {
+				t.Errorf("the destination holds %q, want %q", got, tc.wantDest)
+			}
+		})
+	}
+}
+
+func TestRunKeepsTheSourceWhenTheTransferFails(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte("hello"), time.Now())
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		storage.Resolved{Endpoint: &failingDestEndpoint{}, IsDir: true, Display: "dst"},
+		Options{Recursive: true, RemoveSourceFiles: true, Stats: true},
+		stdout, stderr,
+	)
+	if code != CodePartial {
+		t.Fatalf("Run() = %d, want %d", code, CodePartial)
+	}
+	if _, ok := driver.Get("src", "a.txt"); !ok {
+		t.Error("the source file was removed, want it to be kept")
+	}
+	if !strings.Contains(stdout.String(), "errors=1\n") {
+		t.Errorf("the summary is %q, want it to count the failure", stdout)
+	}
+}
+
+func TestRunPrintsStats(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte("hello"), time.Now())
+	driver.Put("src", "b.txt", []byte("world"), time.Now())
+	driver.Put("dst", "a.txt", []byte("hello"), time.Now())
+	driver.Put("dst", "old.txt", []byte("old"), time.Now())
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		memoryDest(t, driver, "dst"),
+		Options{Recursive: true, Delete: true, RemoveSourceFiles: true, Stats: true},
+		stdout, stderr,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d (%s)", code, CodeOK, stderr)
+	}
+
+	want := "files_total=2\n" +
+		"files_transferred=1\n" +
+		"files_skipped=1\n" +
+		"files_deleted=1\n" +
+		"files_removed=2\n" +
+		"bytes_transferred=5\n" +
+		"errors=0\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("the summary is\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestRunPrintsStatsOnADryRun(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte("hello"), time.Now())
+	driver.Put("src", "b.txt", []byte("world"), time.Now())
+	driver.Put("dst", "a.txt", []byte("hello"), time.Now())
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		memoryDest(t, driver, "dst"),
+		Options{Recursive: true, DryRun: true, RemoveSourceFiles: true, Stats: true},
+		stdout, stderr,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d (%s)", code, CodeOK, stderr)
+	}
+
+	want := "would copy src/b.txt -> dst/b.txt\n" +
+		"would remove src/b.txt\n" +
+		"would remove src/a.txt\n" +
+		"files_total=2\n" +
+		"files_transferred=0\n" +
+		"files_skipped=1\n" +
+		"files_deleted=0\n" +
+		"files_removed=0\n" +
+		"bytes_transferred=0\n" +
+		"errors=0\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("the summary is\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestRunWithABandwidthLimit(t *testing.T) {
+	t.Parallel()
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte(strings.Repeat("x", 8*1024)), time.Now())
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		memoryDest(t, driver, "dst"),
+		Options{Recursive: true, BWLimit: 1 << 20},
+		stdout, stderr,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d (%s)", code, CodeOK, stderr)
+	}
+	if got, ok := driver.Get("dst", "a.txt"); !ok || len(got) != 8*1024 {
+		t.Errorf("the destination holds %d bytes, want %d", len(got), 8*1024)
+	}
+}
+
+func TestRunTellsTheDestinationTheSize(t *testing.T) {
+	t.Parallel()
+
+	const content = "hello world"
+
+	driver := memory.New()
+	driver.Put("src", "a.txt", []byte(content), time.Now())
+	dest := memoryDest(t, driver, "dst")
+	sized := &sizedEndpoint{Endpoint: dest.Endpoint}
+
+	code := Run(t.Context(),
+		[]storage.Resolved{memorySource(t, driver, "src/")},
+		storage.Resolved{Endpoint: sized, IsDir: true, Display: dest.Display},
+		Options{Recursive: true},
+		io.Discard, io.Discard,
+	)
+	if code != CodeOK {
+		t.Fatalf("Run() = %d, want %d", code, CodeOK)
+	}
+	if sized.size != int64(len(content)) {
+		t.Errorf("the destination was told %d bytes, want %d", sized.size, len(content))
+	}
+	if got, ok := driver.Get("dst", "a.txt"); !ok || string(got) != content {
+		t.Errorf("a.txt = %q, want %q", got, content)
+	}
+}
+
+// sizedEndpoint is a destination that records the size it is told.
+type sizedEndpoint struct {
+	storage.Endpoint
+	size int64
+}
+
+// CreateSized records the size and writes the file.
+func (e *sizedEndpoint) CreateSized(ctx context.Context, key string, modTime time.Time, size int64, r io.Reader) error {
+	e.size = size
+	return e.Create(ctx, key, modTime, r)
+}
+
+// failingDestEndpoint lists files but cannot write or delete them.
+type failingDestEndpoint struct{}
+
+// List reports that the destination is empty.
+func (e *failingDestEndpoint) List(_ context.Context, _ string, _ func(storage.FileInfo) error) error {
+	return nil
+}
+
+// Open always fails.
+func (e *failingDestEndpoint) Open(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, errors.New("cannot open")
+}
+
+// Create always fails.
+func (e *failingDestEndpoint) Create(_ context.Context, _ string, _ time.Time, _ io.Reader) error {
+	return errors.New("cannot write")
+}
+
+// Delete always fails.
+func (e *failingDestEndpoint) Delete(_ context.Context, _ string) error {
+	return errors.New("cannot delete")
+}
+
+// memorySource resolves an in-memory source location.
+func memorySource(t *testing.T, driver *memory.Driver, raw string) storage.Resolved {
+	t.Helper()
+
+	loc, err := storage.ParseLocation(raw)
+	if err != nil {
+		t.Fatalf("ParseLocation(%q) = %v", raw, err)
+	}
+	resolved, err := driver.ResolveSource(t.Context(), loc)
+	if err != nil {
+		t.Fatalf("ResolveSource(%q) = %v", raw, err)
+	}
+	return resolved
+}
+
+// memoryDest resolves an in-memory destination location.
+func memoryDest(t *testing.T, driver *memory.Driver, raw string) storage.Resolved {
+	t.Helper()
+
+	loc, err := storage.ParseLocation(raw)
+	if err != nil {
+		t.Fatalf("ParseLocation(%q) = %v", raw, err)
+	}
+	resolved, err := driver.ResolveDest(t.Context(), loc, false)
+	if err != nil {
+		t.Fatalf("ResolveDest(%q) = %v", raw, err)
+	}
+	return resolved
+}
+
 // objectEndpoint mimics an object store: it reports the time a file was
 // uploaded, and the modification time that was preserved with it once the
 // caller asks for the times.

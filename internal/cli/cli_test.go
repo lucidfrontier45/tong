@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alecthomas/kong"
+
 	"github.com/lucidfrontier45/tong/internal/filter"
 	"github.com/lucidfrontier45/tong/internal/syncengine"
 )
@@ -32,14 +34,101 @@ func TestRunRejectsUnsupportedOptions(t *testing.T) {
 		{"-z", "src", "dst"},
 		{"-c", "src", "dst"},
 		{"-P", "src", "dst"},
-		{"--stats", "src", "dst"},
-		{"--bwlimit", "100", "src", "dst"},
-		{"--remove-source-files", "src", "dst"},
 	} {
 		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 		code := Run(context.Background(), args, stdout, stderr)
 		if code != syncengine.CodeUsage {
 			t.Errorf("Run(%v) = %d, want %d", args, code, syncengine.CodeUsage)
+		}
+	}
+}
+
+func TestRunRejectsAnInvalidParallelism(t *testing.T) {
+	t.Parallel()
+
+	for _, parallel := range []string{"0", "-1", "many"} {
+		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+		code := Run(context.Background(), []string{"--parallel", parallel, "src", "dst"}, stdout, stderr)
+		if code != syncengine.CodeUsage {
+			t.Errorf("Run(--parallel %s) = %d, want %d", parallel, code, syncengine.CodeUsage)
+		}
+	}
+}
+
+func TestRunDefaultsToFourTransfersAtATime(t *testing.T) {
+	t.Parallel()
+
+	var opts options
+	parser, err := kong.New(&opts)
+	if err != nil {
+		t.Fatalf("kong.New() = %v", err)
+	}
+	if _, err := parser.Parse([]string{"src", "dst"}); err != nil {
+		t.Fatalf("Parse() = %v", err)
+	}
+	if opts.Parallel != 4 {
+		t.Errorf("--parallel defaults to %d, want 4", opts.Parallel)
+	}
+}
+
+func TestRunAppliesTheNewOptions(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	dst := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatalf("cannot write the source: %v", err)
+	}
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := Run(context.Background(), []string{
+		"-a", "--parallel", "2", "--bwlimit", "1M", "--stats", "--remove-source-files",
+		src + "/", dst,
+	}, stdout, stderr)
+	if code != syncengine.CodeOK {
+		t.Fatalf("Run() = %d, want %d (%s)", code, syncengine.CodeOK, stderr)
+	}
+
+	if got := stdout.String(); !strings.Contains(got, "files_transferred=1\n") {
+		t.Errorf("the summary is %q, want it to count the transfer", got)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "a.txt")); err != nil {
+		t.Errorf("a.txt was not copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(src, "a.txt")); err == nil {
+		t.Error("the source file was not removed")
+	}
+}
+
+func TestParseBWLimit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		value string
+		want  int64
+	}{
+		{value: "", want: 0},
+		{value: "0", want: 0},
+		{value: "100", want: 100 * 1024},
+		{value: "1.5K", want: 1536 * 1024},
+		{value: "2M", want: 2 * 1024 * 1024 * 1024},
+	}
+	for _, tc := range tests {
+		got, err := parseBWLimit(tc.value)
+		if err != nil {
+			t.Errorf("parseBWLimit(%q) = %v", tc.value, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseBWLimit(%q) = %d, want %d", tc.value, got, tc.want)
+		}
+	}
+
+	// The value is in KiB, so a size that fits into an int64 as bytes but
+	// not as KiB per second is still too large.
+	for _, value := range []string{"big", "-1", "9223372036854775807", "9007199254740991K"} {
+		if _, err := parseBWLimit(value); err == nil {
+			t.Errorf("parseBWLimit(%q) = nil, want an error", value)
 		}
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -29,6 +29,17 @@ import (
 // stores it next to the object.
 const mtimeMetadata = "mtime"
 
+// defaultPartSize is the size of a multipart part. Sixteen megabytes keeps
+// the memory of an upload bounded, because the parts of an object whose size
+// is not known up front are buffered, and it lifts the 5 GB limit that a
+// single PutObject request has.
+//
+// An object whose size is known is planned with it: the manager grows the
+// part size when the object would not fit into the 10,000 parts that S3
+// allows, so the whole 5 TB that a single object may hold works. Without the
+// size the object tops out at 160 GiB, which is 10,000 parts of this size.
+const defaultPartSize = 16 << 20
+
 // Options configure the S3 driver.
 type Options struct {
 	// Region overrides the region of the AWS configuration.
@@ -37,6 +48,13 @@ type Options struct {
 	// uses path-style addressing, which is what most compatible services
 	// expect.
 	Endpoint string
+	// PartSize overrides the size of a multipart part. Zero means
+	// [defaultPartSize]. It is not exposed on the command line; the tests
+	// use it to exercise multipart uploads with small objects.
+	PartSize int64
+	// UploadConcurrency is the number of parts that are uploaded at the
+	// same time. Zero means the default of the SDK.
+	UploadConcurrency int
 }
 
 // Driver implements [storage.Driver] for s3:// locations.
@@ -94,7 +112,7 @@ func (d *Driver) ResolveSource(ctx context.Context, loc storage.Location) (stora
 	case loc.Key == "":
 		// The whole bucket.
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket, fetchModTime: true},
+			Endpoint: d.newEndpoint(client, loc.Bucket, ""),
 			IsDir:    true,
 			Display:  display(loc),
 		}, nil
@@ -109,7 +127,7 @@ func (d *Driver) ResolveSource(ctx context.Context, loc storage.Location) (stora
 			return storage.Resolved{}, fmt.Errorf("%w: s3://%s/%s", storage.ErrNotFound, loc.Bucket, loc.Key)
 		}
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: loc.Key, fetchModTime: true},
+			Endpoint: d.newEndpoint(client, loc.Bucket, loc.Key),
 			IsDir:    true,
 			Display:  display(loc),
 		}, nil
@@ -132,7 +150,7 @@ func (d *Driver) ResolveSource(ctx context.Context, loc storage.Location) (stora
 			continue
 		}
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: prefix, fetchModTime: true},
+			Endpoint: d.newEndpoint(client, loc.Bucket, prefix),
 			Name:     path.Base(loc.Key),
 			IsDir:    true,
 			Display:  display(loc),
@@ -148,7 +166,7 @@ func (d *Driver) ResolveSource(ctx context.Context, loc storage.Location) (stora
 			parent = loc.Key[:i+1]
 		}
 		return storage.Resolved{
-			Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: parent, fetchModTime: true},
+			Endpoint: d.newEndpoint(client, loc.Bucket, parent),
 			FileKey:  path.Base(loc.Key),
 			Display:  display(loc),
 		}, nil
@@ -186,7 +204,7 @@ func (d *Driver) ResolveDest(ctx context.Context, loc storage.Location, singleFi
 				parent = prefix[:i+1]
 			}
 			return storage.Resolved{
-				Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: parent, fetchModTime: true},
+				Endpoint: d.newEndpoint(client, loc.Bucket, parent),
 				Name:     path.Base(prefix),
 				Display:  display(loc),
 			}, nil
@@ -195,10 +213,26 @@ func (d *Driver) ResolveDest(ctx context.Context, loc storage.Location, singleFi
 	}
 
 	return storage.Resolved{
-		Endpoint: &endpoint{client: client, bucket: loc.Bucket, prefix: prefix, fetchModTime: true},
+		Endpoint: d.newEndpoint(client, loc.Bucket, prefix),
 		IsDir:    true,
 		Display:  display(loc),
 	}, nil
+}
+
+// newEndpoint returns a rooted view of a bucket.
+func (d *Driver) newEndpoint(client *awss3.Client, bucket, prefix string) *endpoint {
+	partSize := d.opts.PartSize
+	if partSize == 0 {
+		partSize = defaultPartSize
+	}
+	return &endpoint{
+		client:       client,
+		bucket:       bucket,
+		prefix:       prefix,
+		partSize:     partSize,
+		concurrency:  d.opts.UploadConcurrency,
+		fetchModTime: true,
+	}
 }
 
 // endpoint is a rooted view of a bucket.
@@ -207,9 +241,19 @@ type endpoint struct {
 	bucket string
 	// prefix is the key prefix the endpoint is rooted at.
 	prefix string
+	// partSize is the size of a multipart part.
+	partSize int64
+	// concurrency is the number of parts that are uploaded at the same
+	// time. Zero means the default of the SDK.
+	concurrency int
 	// fetchModTime tells whether the listing looks up the modification
 	// time of every object it finds.
 	fetchModTime bool
+
+	mu sync.Mutex
+	// mp is the transfer manager that uploads objects in parts, created on
+	// first use.
+	mp *transfermanager.Client
 }
 
 // UseModTime tells the endpoint whether the modification times of the listed
@@ -351,29 +395,67 @@ func (e *endpoint) Open(ctx context.Context, key string) (io.ReadCloser, error) 
 	return out.Body, nil
 }
 
-// Create writes an object.
+// Create writes an object of unknown size.
+//
+// The upload goes through the transfer manager of the SDK: a small object is
+// written with a single request, a large one is split into parts that are
+// uploaded as many at a time as the run allows. The metadata, which carries
+// the preserved modification time, is passed to both.
 func (e *endpoint) Create(ctx context.Context, key string, modTime time.Time, r io.Reader) error {
-	body, cleanup, err := seekable(r)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
+	return e.create(ctx, key, modTime, 0, r)
+}
 
+// CreateSized writes an object whose size the caller knows, which lets the
+// transfer manager plan the upload: it decides whether the object fits into a
+// single request, and it grows the part size when the object would otherwise
+// need more parts than S3 accepts.
+func (e *endpoint) CreateSized(ctx context.Context, key string, modTime time.Time, size int64, r io.Reader) error {
+	return e.create(ctx, key, modTime, size, r)
+}
+
+// create writes an object. A size that is not positive is not declared.
+func (e *endpoint) create(ctx context.Context, key string, modTime time.Time, size int64, r io.Reader) error {
 	metadata := map[string]string{}
 	if !modTime.IsZero() {
 		metadata[mtimeMetadata] = strconv.FormatInt(modTime.Unix(), 10)
 	}
 
-	_, err = e.client.PutObject(ctx, &awss3.PutObjectInput{
+	input := &transfermanager.UploadObjectInput{
 		Bucket:   aws.String(e.bucket),
 		Key:      aws.String(e.key(key)),
-		Body:     body,
+		Body:     r,
 		Metadata: metadata,
-	})
-	if err != nil {
+	}
+	if size > 0 {
+		input.ContentLength = aws.Int64(size)
+	}
+
+	if _, err := e.uploader().UploadObject(ctx, input); err != nil {
 		return fmt.Errorf("cannot write s3://%s/%s: %w", e.bucket, e.key(key), err)
 	}
 	return nil
+}
+
+// uploader returns the transfer manager of the endpoint, creating it on
+// first use. The manager keeps no state between uploads, so every transfer of
+// a run shares it.
+func (e *endpoint) uploader() *transfermanager.Client {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.mp == nil {
+		e.mp = transfermanager.New(e.client, func(o *transfermanager.Options) {
+			o.PartSizeBytes = e.partSize
+			// An object that is smaller than a part is written with a
+			// single request, which is what a small file should cost.
+			o.MultipartUploadThreshold = e.partSize
+			o.Concurrency = e.concurrency
+			// A failed upload aborts its parts: resumable multipart
+			// uploads are not supported yet, and leaving them behind
+			// would cost storage for every failed transfer.
+		})
+	}
+	return e.mp
 }
 
 // Delete removes an object.
@@ -401,35 +483,6 @@ func isNotFound(err error) bool {
 // engine can tell a vanished file from a failed transfer.
 func notFoundError(message, err error) error {
 	return fmt.Errorf("%w: %w", message, errors.Join(storage.ErrNotFound, err))
-}
-
-// seekable returns a reader the SDK can compute a checksum of. A body that
-// cannot be rewound is spilled to a temporary file, which keeps the memory
-// use of a transfer bounded.
-func seekable(r io.Reader) (io.Reader, func(), error) {
-	if rs, ok := r.(io.ReadSeeker); ok {
-		return rs, func() {}, nil
-	}
-
-	file, err := os.CreateTemp("", "tong-upload-*")
-	if err != nil {
-		return nil, nil, err
-	}
-	cleanup := func() {
-		name := file.Name()
-		_ = file.Close()
-		_ = os.Remove(name)
-	}
-
-	if _, err := io.Copy(file, r); err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	return file, cleanup, nil
 }
 
 // display renders a location the way the user wrote it.
